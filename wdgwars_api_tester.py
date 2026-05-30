@@ -25,7 +25,7 @@ Quickstart:
 """
 from __future__ import annotations
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 GITHUB_URL = "https://github.com/HiroAlleyCat/wdgwars-api-tester"
 
 import argparse
@@ -115,12 +115,23 @@ def build_probes() -> list[Probe]:
               notes="If 200, LiteSpeed admin telemetry is leaking through "
                     "the unbound /api/ prefix (shared-hosting tenant list, "
                     "request counters, lsphp process internals)."),
-        Probe("api-sentinel-404",
+        Probe("api-sentinel-404-a",
               "GET",
               f"/api/zzz_{secrets.token_hex(8)}_definitely_not_a_route",
               False, (404,),
-              notes="Fingerprints the /api/ 404 page. Other endpoints "
-                    "matching this body hash are DEAD."),
+              notes="Fingerprints the /api/ 404 page. 3-sentinel quorum: at "
+                    "least 2 of (a,b,c) must agree on body_md5 to establish "
+                    "the canonical fingerprint. Endpoints matching it are DEAD."),
+        Probe("api-sentinel-404-b",
+              "GET",
+              f"/api/zzz_{secrets.token_hex(8)}_definitely_not_a_route",
+              False, (404,),
+              notes="Quorum sentinel B."),
+        Probe("api-sentinel-404-c",
+              "GET",
+              f"/api/zzz_{secrets.token_hex(8)}_definitely_not_a_route",
+              False, (404,),
+              notes="Quorum sentinel C."),
         Probe("non-api-sentinel-404",
               "GET",
               f"/zzz_{secrets.token_hex(8)}_definitely_not_a_route",
@@ -224,27 +235,78 @@ def run_once(hosts: list[str], variants: tuple, valid_key: Optional[str],
     return results
 
 
-def annotate_verdicts(results: list[Result]) -> None:
-    """Compare every result against the per-host /api/ sentinel md5.
+SENTINEL_PROBES = ("api-sentinel-404-a", "api-sentinel-404-b", "api-sentinel-404-c")
 
-    A result whose body md5 matches the sentinel for the same host is DEAD —
-    the request didn't reach an endpoint handler.
+
+def _canonical_sentinel(results: list[Result], host: str) -> tuple[str, str]:
+    """Quorum-pick the canonical /api/ 404 fingerprint for one host.
+
+    Returns (canonical_md5, status) where status is one of:
+        "unanimous"   — all 3 sentinels agreed
+        "majority"    — 2 of 3 agreed (one diverged, e.g. CDN cache slip)
+        "diverged"    — all 3 distinct, no canonical fingerprint
+        "no-data"     — fewer than 2 sentinels returned a body
+
+    DEAD detection only fires when status is unanimous or majority. Diverged
+    sentinels disable DEAD detection for that host and emit a warning.
     """
-    sentinels = {r.host: r.body_md5 for r in results if r.probe == "api-sentinel-404"}
-    non_api_sentinels = {r.host: r.body_md5 for r in results if r.probe == "non-api-sentinel-404"}
+    hashes = [r.body_md5 for r in results
+              if r.probe in SENTINEL_PROBES and r.host == host and r.body_md5]
+    if len(hashes) < 2:
+        return ("", "no-data")
+    # Count occurrences manually to stay stdlib-Counter-free in case the
+    # caller wants to vendor this single file with no imports beyond top.
+    counts: dict[str, int] = {}
+    for h in hashes:
+        counts[h] = counts.get(h, 0) + 1
+    top_hash, top_count = max(counts.items(), key=lambda kv: kv[1])
+    if top_count == 3:
+        return (top_hash, "unanimous")
+    if top_count == 2:
+        return (top_hash, "majority")
+    return ("", "diverged")
+
+
+def annotate_verdicts(results: list[Result]) -> None:
+    """Verdict-tag every result using a quorum sentinel for DEAD detection.
+
+    Three random /api/<token> probes per run define the canonical /api/ 404
+    fingerprint via 2-of-3 majority. A probe whose body_md5 matches the
+    canonical fingerprint is labeled DEAD (route not bound). If the three
+    sentinels diverge, DEAD detection is disabled for that host and the
+    sentinels themselves are labeled SENTINEL-DIVERGED.
+    """
+    canonical: dict[str, tuple[str, str]] = {}
+    hosts_seen = {r.host for r in results}
+    for host in hosts_seen:
+        canonical[host] = _canonical_sentinel(results, host)
+    non_api_sentinels = {r.host: r.body_md5
+                          for r in results if r.probe == "non-api-sentinel-404"}
+
     for r in results:
         if r.error:
             r.verdict = "ERROR"
             continue
-        s = sentinels.get(r.host, "")
+        api_md5, quorum_status = canonical.get(r.host, ("", "no-data"))
         nas = non_api_sentinels.get(r.host, "")
-        if r.probe == "api-sentinel-404":
-            r.verdict = "SENTINEL"
+
+        if r.probe in SENTINEL_PROBES:
+            if quorum_status == "diverged":
+                r.verdict = "SENTINEL-DIVERGED"
+            elif quorum_status == "majority" and r.body_md5 != api_md5:
+                r.verdict = "SENTINEL-OUTLIER"  # the 1 of 3 that disagreed
+            else:
+                r.verdict = "SENTINEL"
         elif r.probe == "non-api-sentinel-404":
             r.verdict = "SENTINEL-NONAPI"
-        elif r.probe == "stats-leak-check" and r.status == 200:
-            r.verdict = "LEAK"
-        elif r.body_md5 and s and r.body_md5 == s:
+        elif r.probe == "stats-leak-check":
+            # 200 = LeakSpeed admin telemetry exposed. Any non-200 =
+            # endpoint is suppressed, which is the desired state. We do
+            # not want to label this DEAD just because it happens to
+            # return the same body as the /api/ unbound fallback — that
+            # would degrade the summary on a correctly-blocked endpoint.
+            r.verdict = "LEAK" if r.status == 200 else "BLOCKED"
+        elif r.body_md5 and api_md5 and r.body_md5 == api_md5:
             r.verdict = "DEAD"
         elif r.body_md5 and nas and r.body_md5 == nas:
             r.verdict = "DEAD-NONAPI"
@@ -267,8 +329,9 @@ def annotate_verdicts(results: list[Result]) -> None:
 # ───────────────────────────── Rendering ──────────────────────────────────────
 
 VERDICT_PRIORITY = {
-    "ERROR": 0, "LEAK": 1, "DEAD": 2, "DEAD-NONAPI": 3, "404": 4,
-    "METHOD": 5, "AUTH-REQUIRED": 6, "OK": 7, "SENTINEL": 8, "SENTINEL-NONAPI": 9,
+    "ERROR": 0, "SENTINEL-DIVERGED": 1, "LEAK": 2, "DEAD": 3, "DEAD-NONAPI": 4,
+    "SENTINEL-OUTLIER": 5, "404": 6, "METHOD": 7, "AUTH-REQUIRED": 8, "OK": 9,
+    "BLOCKED": 10, "SENTINEL": 11, "SENTINEL-NONAPI": 12,
 }
 
 
@@ -309,10 +372,46 @@ def summary(results: list[Result]) -> dict:
         overall = overall + "+LEAK"
     if by_verdict.get("ERROR", 0) > 0 and overall == "HEALTHY":
         overall = "UNREACHABLE"
+    # Sentinel quorum failure: the diagnostic itself is broken (3 random
+    # /api/<token> paths returned 3 distinct bodies). DEAD detection is
+    # unreliable until the operator investigates. Surface it loudly.
+    if by_verdict.get("SENTINEL-DIVERGED", 0) > 0:
+        overall = overall + "+SENTINEL-DIVERGED"
     return {"overall": overall, "by_verdict": by_verdict, "total": len(results)}
 
 
 # ───────────────────────────── Baseline diff ─────────────────────────────────
+
+def _probe_deltas(prev: list[Result], curr: list[Result]) -> list[str]:
+    """Compact per-probe deltas between two result sets.
+
+    Lines look like:
+        wdgwars.pl me/none           DEAD/404 -> AUTH-REQUIRED/401
+        wdgwars.pl stats-leak-check  LEAK/200 -> 404/404
+
+    Only probes whose verdict OR status changed are emitted. NEW / GONE keys
+    (probe added or removed between runs) are flagged explicitly.
+    """
+    def key(r: Result) -> tuple[str, str, str]:
+        return (r.host, r.probe, r.auth)
+
+    prev_map = {key(r): r for r in prev}
+    curr_map = {key(r): r for r in curr}
+    lines: list[str] = []
+    all_keys = sorted(set(prev_map) | set(curr_map))
+    for k in all_keys:
+        p = prev_map.get(k)
+        c = curr_map.get(k)
+        host = k[0].replace("https://", "")
+        label = f"{host} {k[1]}/{k[2]}"
+        if p is None:
+            lines.append(f"{label:<48} NEW -> {c.verdict}/{c.status}")
+        elif c is None:
+            lines.append(f"{label:<48} GONE (was {p.verdict}/{p.status})")
+        elif p.verdict != c.verdict or p.status != c.status:
+            lines.append(f"{label:<48} {p.verdict}/{p.status} -> {c.verdict}/{c.status}")
+    return lines
+
 
 def state_signature(results: list[Result]) -> str:
     """Stable hash of (probe, host, auth, verdict, status) tuples.
@@ -382,8 +481,14 @@ def main(argv: Optional[list[str]] = None) -> int:
                    help="Emit JSON results to stdout. Table still goes to stderr.")
     p.add_argument("--no-table", action="store_true",
                    help="Suppress the human-readable table.")
+    p.add_argument("--quiet", action="store_true",
+                   help="Print only the overall verdict word to stdout "
+                   "(HEALTHY / DEGRADED / OUTAGE / UNREACHABLE, with optional "
+                   "+LEAK or +SENTINEL-DIVERGED suffix). Implies --no-table. "
+                   "Pairs with exit code 0/1 for shell pipelines and CI.")
     p.add_argument("--watch", type=float, default=0.0,
-                   help="Loop every N seconds. Print only on state change.")
+                   help="Loop every N seconds. Print compact deltas on state "
+                   "change; full table only on transition into HEALTHY.")
     p.add_argument("--baseline", type=Path,
                    help="Path to a baseline JSON file. If missing, written on first "
                    "run. If present, diffs are reported.")
@@ -403,6 +508,10 @@ def main(argv: Optional[list[str]] = None) -> int:
                     "Set $WDGWARS_API_KEY or ~/.config/wigle-to-wdgwars/wdgwars.key.")
         variants = tuple(v for v in variants if v != "valid")
 
+    # --quiet implies --no-table; it also suppresses --json.
+    if args.quiet:
+        args.no_table = True
+
     def one_pass() -> tuple[list[Result], dict, str]:
         results = run_once(hosts, variants, valid_key, args.timeout)
         s = summary(results)
@@ -410,6 +519,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         return results, s, sig
 
     def emit(results: list[Result], s: dict) -> None:
+        if args.quiet:
+            print(s["overall"])
+            return
         if not args.no_table:
             print(render_table(results), file=sys.stderr)
             print("", file=sys.stderr)
@@ -428,16 +540,38 @@ def main(argv: Optional[list[str]] = None) -> int:
             print(json.dumps(payload, indent=2))
 
     if args.watch and args.watch > 0:
-        last_sig = ""
+        last_results: Optional[list[Result]] = None
+        last_overall: str = ""
         log.info("watch mode: polling every %.0fs, printing on change", args.watch)
         try:
             while True:
-                results, s, sig = one_pass()
-                if sig != last_sig:
-                    log.info("--- state change @ %s ---",
+                results, s, _sig = one_pass()
+                overall = s["overall"]
+                if last_results is None:
+                    # First pass: print full table so the operator sees the
+                    # starting state, then settle into delta-only output.
+                    log.info("--- initial state @ %s ---",
                              time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
                     emit(results, s)
-                    last_sig = sig
+                elif overall != last_overall or _probe_deltas(last_results, results):
+                    deltas = _probe_deltas(last_results, results)
+                    recovery = (overall == "HEALTHY" and last_overall != "HEALTHY")
+                    header = "RECOVERY" if recovery else "state change"
+                    log.info("--- %s @ %s   (%s -> %s) ---",
+                             header,
+                             time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                             last_overall, overall)
+                    for line in deltas:
+                        log.info("  %s", line)
+                    if recovery and not args.quiet:
+                        # Full table on the recovery moment so the operator
+                        # can verify the post-fix verdict surface in one shot.
+                        log.info("")
+                        emit(results, s)
+                    elif args.quiet:
+                        emit(results, s)
+                last_results = results
+                last_overall = overall
                 time.sleep(args.watch)
         except KeyboardInterrupt:
             return 0
