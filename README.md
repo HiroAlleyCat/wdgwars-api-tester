@@ -231,11 +231,34 @@ If you ship a fork, MIT means clone-and-rename is fine — no need to credit ups
 
 ## Tests
 
+Two suites, both stdlib only.
+
+### Unit tests (offline, fast)
+
 ```
 python3 -m unittest test_wdgwars_api_tester
 ```
 
-32 tests, no network, stdlib only. Covers verdict annotation, quorum sentinel logic, state signature stability, summary rollup, probe delta detection, Telegram message formatting, and webhook payload shape.
+32 tests, no network. Covers verdict annotation, quorum sentinel logic, state signature stability, summary rollup, probe delta detection, Telegram message formatting, and webhook payload shape. Runs in under a second.
+
+### Integration tests (live API + local mock HTTP)
+
+```
+python3 integration_test.py
+```
+
+16 end-to-end scenarios. Hits the real `wdgwars.pl` host (same as the tool itself) and spins up a local HTTP server on a random port to capture webhook POSTs. Covers:
+
+- `--version`, `--help`, default one-shot, `--quiet`, `--json`, `--no-table`
+- Invalid `--variants` rejection
+- `--valid` variant drop on missing key (with HOME / USERPROFILE override so the config-file fallback can't pollute the test)
+- `--baseline` first-run file creation + second-run diff detection
+- All three notification guard rails (`--alert-telegram` / `--alert-webhook` / `--exec-on-change` without `--watch` warn and disable)
+- Watch-mode credential check (`--alert-telegram` + `--watch` without env vars warns at startup)
+- **End-to-end notification dispatch:** `_format_webhook_payload()` + `_post_webhook()` against a local mock receiver, with payload assertions (Slack `text`, Discord `content`, structured fields). `_exec_on_change()` against a cross-platform Python helper that captures all `WDGWARS_*` env vars to a sink file.
+- Live JSON schema check: every probe documented in this README must appear in the snapshot, the 3-sentinel quorum produces ≤2 distinct hashes in non-diverged states.
+
+Takes about 80 seconds (most of it real HTTP latency to wdgwars.pl). Exit 0 = all green.
 
 ## Related
 
