@@ -25,7 +25,7 @@ Quickstart:
 """
 from __future__ import annotations
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 GITHUB_URL = "https://github.com/HiroAlleyCat/wdgwars-api-tester"
 
 import argparse
@@ -35,6 +35,7 @@ import json
 import logging
 import os
 import secrets
+import subprocess
 import sys
 import time
 import urllib.error
@@ -460,6 +461,106 @@ def _post_telegram(token: str, chat_id: str, text: str,
         return False
 
 
+# ───────────────────────────── Generic webhook ───────────────────────────────
+#
+# POSTs a structured JSON payload to any HTTP endpoint on state change. The
+# payload carries both `text` (Slack-style) and `content` (Discord-style)
+# keys so it works out of the box for both, plus structured fields for any
+# generic handler (n8n, PagerDuty Events v2, custom Flask/FastAPI, etc.).
+
+
+def _format_webhook_payload(prev_overall: str, curr_overall: str,
+                             deltas: list[str], by_verdict: dict) -> dict:
+    """Pure formatter. Returns a dict ready for json.dumps."""
+    if curr_overall == "HEALTHY" and prev_overall != "HEALTHY":
+        emoji = "✅"
+        kind = "recovery"
+    elif "SENTINEL-DIVERGED" in curr_overall:
+        emoji = "🔧"
+        kind = "diagnostic-broken"
+    else:
+        emoji = "🚨"
+        kind = "regression"
+
+    headline = f"{emoji} wdgwars-api-tester: {prev_overall} → {curr_overall}"
+    delta_block = "\n".join(deltas[:30]) if deltas else "(no per-probe deltas)"
+    verdicts_str = ", ".join(f"{k}={v}" for k, v in sorted(by_verdict.items()))
+    flat = f"{headline}\n\n{delta_block}\n\nverdicts: {verdicts_str}"
+
+    return {
+        # Slack incoming-webhook field
+        "text": flat,
+        # Discord webhook field
+        "content": flat,
+        # Generic / structured consumers
+        "title": headline,
+        "kind": kind,
+        "overall": curr_overall,
+        "prev_overall": prev_overall,
+        "deltas": list(deltas),
+        "by_verdict": dict(by_verdict),
+        "tool": "wdgwars-api-tester",
+        "version": __version__,
+    }
+
+
+def _post_webhook(url: str, payload: dict, timeout: float = 10.0) -> bool:
+    """POST a JSON payload to an arbitrary webhook URL."""
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data,
+        headers={"Content-Type": "application/json", "User-Agent": USER_AGENT},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return 200 <= resp.status < 300
+    except urllib.error.HTTPError as e:
+        log.warning("webhook post failed: HTTP %s", e.code)
+        return False
+    except Exception as e:  # noqa: BLE001
+        log.warning("webhook post failed: %s", e)
+        return False
+
+
+# ───────────────────────────── Exec-on-change hook ───────────────────────────
+#
+# Runs an arbitrary shell command on state change, with env vars set so the
+# operator's script has everything it needs. Use this when no webhook fits —
+# send email via mail(1), trigger a Lambda via aws CLI, write to a database,
+# pipe to logger, whatever. Trust model: the operator authored the command.
+
+
+def _exec_on_change(cmd: str, prev_overall: str, curr_overall: str,
+                     deltas: list[str], by_verdict: dict,
+                     timeout: float = 15.0) -> bool:
+    """Run cmd with state info exported as env vars. Returns True on rc=0."""
+    env = os.environ.copy()
+    env["WDGWARS_OVERALL"] = curr_overall
+    env["WDGWARS_PREV_OVERALL"] = prev_overall
+    env["WDGWARS_DELTAS"] = "\n".join(deltas)
+    env["WDGWARS_VERDICTS"] = json.dumps(by_verdict)
+    env["WDGWARS_RECOVERY"] = "1" if (curr_overall == "HEALTHY"
+                                       and prev_overall != "HEALTHY") else "0"
+    env["WDGWARS_KIND"] = (
+        "recovery" if env["WDGWARS_RECOVERY"] == "1"
+        else "diagnostic-broken" if "SENTINEL-DIVERGED" in curr_overall
+        else "regression")
+    try:
+        r = subprocess.run(cmd, shell=True, env=env, timeout=timeout,
+                            capture_output=True, text=True)
+        if r.returncode != 0:
+            log.warning("exec-on-change rc=%d stderr=%s",
+                        r.returncode, r.stderr.strip()[:200])
+        return r.returncode == 0
+    except subprocess.TimeoutExpired:
+        log.warning("exec-on-change timed out after %ss", timeout)
+        return False
+    except Exception as e:  # noqa: BLE001
+        log.warning("exec-on-change failed: %s", e)
+        return False
+
+
 def _probe_deltas(prev: list[Result], curr: list[Result]) -> list[str]:
     """Compact per-probe deltas between two result sets.
 
@@ -580,6 +681,18 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--telegram-chat-id",
                    help="Override $TELEGRAM_CHAT_ID. Positive int for DMs, "
                    "negative for groups, -100... for channels.")
+    p.add_argument("--alert-webhook",
+                   help="In --watch mode, POST a JSON payload to this URL on "
+                   "every state change. Works for Discord webhooks, Slack "
+                   "incoming webhooks, n8n, PagerDuty Events v2, or any "
+                   "generic HTTP endpoint — payload carries both `text` "
+                   "(Slack), `content` (Discord), and structured fields.")
+    p.add_argument("--exec-on-change",
+                   help="In --watch mode, run this shell command on every "
+                   "state change. Env vars exported: WDGWARS_OVERALL, "
+                   "WDGWARS_PREV_OVERALL, WDGWARS_DELTAS (newline-joined), "
+                   "WDGWARS_VERDICTS (JSON), WDGWARS_RECOVERY (1/0), "
+                   "WDGWARS_KIND (recovery|regression|diagnostic-broken).")
     p.add_argument("--version", action="version", version=__version__)
     args = p.parse_args(argv)
 
@@ -612,6 +725,12 @@ def main(argv: Optional[list[str]] = None) -> int:
             log.warning("--alert-telegram set but TELEGRAM_BOT_TOKEN or "
                         "TELEGRAM_CHAT_ID missing. Disabling.")
             args.alert_telegram = False
+
+    if (args.alert_webhook or args.exec_on_change) and not args.watch:
+        log.warning("--alert-webhook and --exec-on-change require --watch; "
+                    "one-shot mode has no state to alert on. Ignoring.")
+        args.alert_webhook = None
+        args.exec_on_change = None
 
     def one_pass() -> tuple[list[Result], dict, str]:
         results = run_once(hosts, variants, valid_key, args.timeout)
@@ -677,6 +796,18 @@ def main(argv: Optional[list[str]] = None) -> int:
                         ok = _post_telegram(tg_token, tg_chat_id, text)
                         log.info("  telegram: %s",
                                  "sent" if ok else "FAILED")
+                    if args.alert_webhook:
+                        payload = _format_webhook_payload(
+                            last_overall, overall, deltas, s["by_verdict"])
+                        ok = _post_webhook(args.alert_webhook, payload)
+                        log.info("  webhook: %s",
+                                 "sent" if ok else "FAILED")
+                    if args.exec_on_change:
+                        ok = _exec_on_change(
+                            args.exec_on_change, last_overall, overall,
+                            deltas, s["by_verdict"])
+                        log.info("  exec-on-change: %s",
+                                 "ok" if ok else "FAILED")
                 last_results = results
                 last_overall = overall
                 time.sleep(args.watch)

@@ -41,6 +41,14 @@ python3 wdgwars_api_tester.py --baseline baseline.json
 export TELEGRAM_BOT_TOKEN=123456:ABC...
 export TELEGRAM_CHAT_ID=-1001234567890
 python3 wdgwars_api_tester.py --watch 60 --alert-telegram
+
+# Watch + Discord / Slack / n8n / PagerDuty (any webhook URL)
+python3 wdgwars_api_tester.py --watch 60 \
+   --alert-webhook https://discord.com/api/webhooks/.../...
+
+# Watch + arbitrary shell command on state change
+python3 wdgwars_api_tester.py --watch 60 \
+   --exec-on-change 'echo "$WDGWARS_PREV_OVERALL → $WDGWARS_OVERALL" | mail -s "wdgwars alert" me@example.com'
 ```
 
 ## API key
@@ -113,7 +121,19 @@ Cron example:
                                 --json >> /var/log/wdgwars/snapshots.jsonl
 ```
 
-## Telegram self-paging (optional)
+## Notification channels
+
+`--watch` mode supports three independent notification paths. Use one, two, or all three at once — they don't conflict.
+
+| Flag | Use when |
+|---|---|
+| `--alert-telegram` | You have a Telegram bot + chat. Easiest setup. |
+| `--alert-webhook URL` | You're on Discord, Slack, n8n, PagerDuty, or any service that takes a JSON POST. |
+| `--exec-on-change CMD` | None of the above fit — email, SMS, a Lambda, write to a database, pipe to logger. |
+
+Failure in any one path logs a warning to stderr but never crashes the watch loop or blocks the others.
+
+### Telegram self-paging
 
 In `--watch` mode the tool can post directly to a Telegram chat on every state change. No external broker, webhook service, or alerting infrastructure required — stdlib `urllib` to the Bot API and a chat id.
 
@@ -142,9 +162,72 @@ Or pass them inline: `--telegram-bot-token <token> --telegram-chat-id <id>`.
 
 Body includes the `prev_overall → curr_overall` transition, per-probe deltas (capped at 30 lines for Telegram's 4096-char message limit), and a verdict count rollup. Uses HTML parse mode so `<b>` / `<code>` render correctly.
 
-### Failure handling
+### Generic webhook (`--alert-webhook URL`)
 
-Telegram post failures (network blip, invalid token, banned bot) log a warning to stderr but never crash the watch loop. The tool keeps polling and pages on the next transition.
+POSTs a JSON payload to any HTTP endpoint on state change. The payload carries multiple top-level keys so the same URL works for several services without per-service flags:
+
+```json
+{
+  "text": "🚨 wdgwars-api-tester: HEALTHY → OUTAGE+LEAK\n\n<deltas>\n\nverdicts: DEAD=10, LEAK=1",
+  "content": "<same as text — Discord reads this>",
+  "title": "🚨 wdgwars-api-tester: HEALTHY → OUTAGE+LEAK",
+  "kind": "regression",
+  "overall": "OUTAGE+LEAK",
+  "prev_overall": "HEALTHY",
+  "deltas": ["wdgwars.pl me/valid  OK/200 -> DEAD/404", "..."],
+  "by_verdict": {"DEAD": 10, "LEAK": 1, "OK": 1},
+  "tool": "wdgwars-api-tester",
+  "version": "0.4.0"
+}
+```
+
+- **Discord** reads `content`. Drop in any channel webhook URL.
+- **Slack incoming webhooks** read `text`. Same drop-in.
+- **n8n / Zapier / Make** can pick the structured fields directly.
+- **PagerDuty Events v2** — wrap with `--exec-on-change` (it expects a different envelope).
+- **Custom HTTP handlers** — read whatever they need from the structured fields.
+
+### Arbitrary command (`--exec-on-change CMD`)
+
+Runs any shell command on state change. The following env vars are exported into the subprocess:
+
+| Env var | Value |
+|---|---|
+| `WDGWARS_OVERALL` | New overall verdict, e.g. `DEGRADED+LEAK` |
+| `WDGWARS_PREV_OVERALL` | Previous overall verdict |
+| `WDGWARS_KIND` | `recovery` / `regression` / `diagnostic-broken` |
+| `WDGWARS_RECOVERY` | `1` if transitioning into HEALTHY, else `0` |
+| `WDGWARS_DELTAS` | Newline-joined per-probe delta lines |
+| `WDGWARS_VERDICTS` | JSON-encoded `{verdict: count}` dict |
+
+Examples:
+
+```bash
+# Email on every transition
+--exec-on-change 'echo "$WDGWARS_DELTAS" | mail -s "wdgwars: $WDGWARS_OVERALL" me@example.com'
+
+# Only page on regression (not recovery, not diagnostic)
+--exec-on-change '[ "$WDGWARS_KIND" = "regression" ] && /usr/local/bin/page-me.sh "$WDGWARS_OVERALL"'
+
+# Forward to an existing internal alerting service
+--exec-on-change 'curl -X POST -H "Authorization: Bearer $MY_TOKEN" \
+                  -d "{\"summary\":\"$WDGWARS_OVERALL\",\"verdicts\":$WDGWARS_VERDICTS}" \
+                  https://internal.example.com/alert'
+```
+
+The command runs with `shell=True` and a 15-second timeout. Non-zero exit codes log a warning but don't crash the watch loop.
+
+## Adapting the tool for your own service
+
+Single-file, MIT, stdlib only — fork is encouraged. The structure is designed to make these changes easy:
+
+- **Probe a different API.** Edit `build_probes()` to swap the endpoints, methods, and expected statuses. `DEFAULT_HOSTS` / `ALL_HOSTS` at the top change which hosts get probed.
+- **Add new probes.** Append `Probe(...)` entries to `build_probes()`. Each gets the same auth-variant matrix and verdict annotation automatically.
+- **Add a new verdict.** Edit `annotate_verdicts()` to add a branch, then add the verdict to `VERDICT_PRIORITY` so the table sort works, and `summary()` so it rolls up into the overall verdict if relevant.
+- **Customize the sentinel mechanism.** `SENTINEL_PROBES` and `_canonical_sentinel()` define the quorum logic. Change `SENTINEL_PROBES` to use more sentinels, or rewrite `_canonical_sentinel()` to use a different agreement rule.
+- **Different notification format.** Edit `_format_telegram_text()` or `_format_webhook_payload()` directly. Both are pure functions, easy to unit-test.
+
+If you ship a fork, MIT means clone-and-rename is fine — no need to credit upstream.
 
 ## Tests
 
@@ -152,7 +235,7 @@ Telegram post failures (network blip, invalid token, banned bot) log a warning t
 python3 -m unittest test_wdgwars_api_tester
 ```
 
-28 tests, no network, stdlib only. Covers verdict annotation, quorum sentinel logic, state signature stability, summary rollup, probe delta detection, and Telegram message formatting.
+32 tests, no network, stdlib only. Covers verdict annotation, quorum sentinel logic, state signature stability, summary rollup, probe delta detection, Telegram message formatting, and webhook payload shape.
 
 ## Related
 

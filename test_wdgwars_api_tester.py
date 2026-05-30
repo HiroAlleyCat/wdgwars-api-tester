@@ -16,6 +16,7 @@ from wdgwars_api_tester import (
     TELEGRAM_TEXT_LIMIT,
     _canonical_sentinel,
     _format_telegram_text,
+    _format_webhook_payload,
     _probe_deltas,
     annotate_verdicts,
     state_signature,
@@ -328,6 +329,57 @@ class TestTelegramFormatter(unittest.TestCase):
         # Telegram HTML parse_mode requires <b>, <code>, <i>.
         self.assertIn("<b>", text)
         self.assertIn("<code>", text)
+
+
+class TestWebhookFormatter(unittest.TestCase):
+    def test_payload_has_slack_and_discord_keys(self):
+        p = _format_webhook_payload(
+            "HEALTHY", "OUTAGE+LEAK",
+            ["wdgwars.pl me/valid    OK/200 -> DEAD/404"],
+            {"DEAD": 10, "LEAK": 1},
+        )
+        # Discord webhooks read `content`
+        self.assertIn("content", p)
+        self.assertIn("OUTAGE+LEAK", p["content"])
+        # Slack incoming webhooks read `text`
+        self.assertIn("text", p)
+        self.assertIn("OUTAGE+LEAK", p["text"])
+        # Generic / structured consumers
+        self.assertEqual(p["overall"], "OUTAGE+LEAK")
+        self.assertEqual(p["prev_overall"], "HEALTHY")
+        self.assertEqual(p["kind"], "regression")
+        self.assertEqual(p["tool"], "wdgwars-api-tester")
+        self.assertEqual(p["by_verdict"], {"DEAD": 10, "LEAK": 1})
+
+    def test_kind_classification(self):
+        recov = _format_webhook_payload(
+            "OUTAGE+LEAK", "HEALTHY", [], {"OK": 11})
+        self.assertEqual(recov["kind"], "recovery")
+
+        diag = _format_webhook_payload(
+            "DEGRADED+LEAK", "DEGRADED+LEAK+SENTINEL-DIVERGED", [], {})
+        self.assertEqual(diag["kind"], "diagnostic-broken")
+
+        regr = _format_webhook_payload(
+            "HEALTHY", "DEGRADED", [], {"DEAD": 5})
+        self.assertEqual(regr["kind"], "regression")
+
+    def test_payload_is_json_serializable(self):
+        import json as _json
+        p = _format_webhook_payload(
+            "HEALTHY", "DEGRADED+LEAK",
+            ["a/b/c  OK/200 -> DEAD/404"],
+            {"DEAD": 1, "LEAK": 1},
+        )
+        # Must round-trip cleanly — no datetime, no bytes, no custom types.
+        encoded = _json.dumps(p)
+        decoded = _json.loads(encoded)
+        self.assertEqual(decoded["overall"], "DEGRADED+LEAK")
+
+    def test_emoji_prefix_per_kind(self):
+        self.assertIn("✅", _format_webhook_payload("DEGRADED", "HEALTHY", [], {})["title"])
+        self.assertIn("🔧", _format_webhook_payload("DEGRADED", "DEGRADED+SENTINEL-DIVERGED", [], {})["title"])
+        self.assertIn("🚨", _format_webhook_payload("HEALTHY", "OUTAGE", [], {})["title"])
 
 
 if __name__ == "__main__":
