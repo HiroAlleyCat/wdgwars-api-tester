@@ -25,7 +25,7 @@ Quickstart:
 """
 from __future__ import annotations
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 GITHUB_URL = "https://github.com/HiroAlleyCat/wdgwars-api-tester"
 
 import argparse
@@ -648,8 +648,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         prog="wdgwars-api-tester",
         description="Probe the WDGoWars HTTP API surface and report verdicts.",
     )
-    p.add_argument("--hosts", choices=["apex", "all"], default="apex",
-                   help="apex = wdgwars.pl only (default); all = apex + www + api.")
+    p.add_argument("--hosts", default="apex",
+                   help="apex = wdgwars.pl only (default); all = apex + www + "
+                   "api; OR a comma-separated list of full URLs (e.g. "
+                   "http://127.0.0.1:9999) to probe a custom host. Use the URL "
+                   "form to point at staging, a fork, or a local mock for "
+                   "testing without hitting the real API.")
     p.add_argument("--variants", default="none,garbage,valid",
                    help="Comma list of auth variants to run (none,garbage,valid).")
     p.add_argument("--key", help="Override valid X-API-Key. Falls back to "
@@ -696,7 +700,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--version", action="version", version=__version__)
     args = p.parse_args(argv)
 
-    hosts = ALL_HOSTS if args.hosts == "all" else DEFAULT_HOSTS
+    if args.hosts == "apex":
+        hosts = DEFAULT_HOSTS
+    elif args.hosts == "all":
+        hosts = ALL_HOSTS
+    elif args.hosts.startswith(("http://", "https://")):
+        hosts = [h.strip().rstrip("/") for h in args.hosts.split(",") if h.strip()]
+    else:
+        log.error("invalid --hosts: %r. Use 'apex', 'all', or a "
+                   "comma-separated list of http(s):// URLs.", args.hosts)
+        return 2
     variants = tuple(v.strip() for v in args.variants.split(",") if v.strip())
     bad = [v for v in variants if v not in AUTH_VARIANTS]
     if bad:

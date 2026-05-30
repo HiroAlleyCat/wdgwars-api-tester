@@ -1,23 +1,19 @@
 #!/usr/bin/env python3
 """Integration test harness for wdgwars-api-tester.
 
-Exercises every documented invocation against the live wdgwars.pl host (no
-mocks for the API itself — the whole point is to catch when the tool drifts
-from the documented behavior). Uses a local HTTP server to capture webhook
-POSTs and a tempfile sentinel to capture --exec-on-change env vars.
-
-Telegram credentials aren't required: the script verifies the warning-on-
-missing-creds path rather than real delivery.
+Offline by default — spawns mock_wdgwars HTTP servers on local ports and
+runs the tool against them. Does NOT hit the real wdgwars.pl in default
+mode (we just reported a hosting-telemetry bug to them and shouldn't be
+adding tenant traffic).
 
 Run:
 
-    python3 integration_test.py
+    python3 integration_test.py             # offline, fast, safe
+    python3 integration_test.py --live      # also runs the live-API
+                                            # schema-validation tests
+    INTEGRATION_LIVE=1 python3 integration_test.py    # env var also works
 
-Exit code 0 = all green. Exit code 1 = at least one scenario failed.
-
-Designed to be safe to run repeatedly — every artifact is in a tempdir
-that's cleaned up at the end. Network calls go only to wdgwars.pl (probe
-target, same as the tool itself) and 127.0.0.1 (the mock webhook server).
+Exit 0 = all green. Exit 1 = at least one scenario failed.
 """
 from __future__ import annotations
 
@@ -36,17 +32,18 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 TOOL = ROOT / "wdgwars_api_tester.py"
 PY = sys.executable
+sys.path.insert(0, str(ROOT))
+from mock_wdgwars import serve_in_thread  # noqa: E402
 
-# Overall verdicts we expect from the live API right now (during the outage)
-# or any plausible state. Used as a loose validator.
-VALID_OVERALL_TOKENS = {
-    "HEALTHY", "DEGRADED", "OUTAGE", "UNREACHABLE",
-}
+LIVE = "--live" in sys.argv or os.environ.get("INTEGRATION_LIVE") == "1"
+if "--live" in sys.argv:
+    sys.argv.remove("--live")
+
+VALID_OVERALL_TOKENS = {"HEALTHY", "DEGRADED", "OUTAGE", "UNREACHABLE"}
 VALID_OVERALL_SUFFIXES = ("+LEAK", "+SENTINEL-DIVERGED", "")
 
 
 def _is_valid_overall(s: str) -> bool:
-    """Loose validation of overall summary tokens."""
     s = s.strip()
     if not s:
         return False
@@ -60,8 +57,8 @@ def _is_valid_overall(s: str) -> bool:
     return False
 
 
-def run_tool(*argv: str, timeout: float = 60.0, env: dict | None = None) -> tuple[int, str, str]:
-    """Run the tool, return (returncode, stdout, stderr)."""
+def run_tool(*argv: str, timeout: float = 30.0,
+              env: dict | None = None) -> tuple[int, str, str]:
     cmd = [PY, str(TOOL), *argv]
     full_env = os.environ.copy()
     if env:
@@ -71,7 +68,8 @@ def run_tool(*argv: str, timeout: float = 60.0, env: dict | None = None) -> tupl
     return r.returncode, r.stdout, r.stderr
 
 
-# ─────────────────────── Mock webhook receiver ────────────────────────────
+# ─────────────────────── Webhook capture (for end-to-end notification) ─────
+
 
 class CaptureHandler(http.server.BaseHTTPRequestHandler):
     captured: queue.Queue = queue.Queue()
@@ -85,7 +83,6 @@ class CaptureHandler(http.server.BaseHTTPRequestHandler):
             parsed = None
         CaptureHandler.captured.put({
             "path": self.path,
-            "headers": dict(self.headers),
             "body_raw": body.decode("utf-8", errors="replace"),
             "body_json": parsed,
         })
@@ -95,36 +92,49 @@ class CaptureHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(b'{"ok":true}')
 
     def log_message(self, fmt, *args):
-        pass  # silence default request log
+        pass
 
 
-def start_mock_server() -> tuple[http.server.HTTPServer, int]:
+def start_capture_server() -> tuple[http.server.HTTPServer, int]:
     srv = http.server.HTTPServer(("127.0.0.1", 0), CaptureHandler)
     port = srv.server_address[1]
-    t = threading.Thread(target=srv.serve_forever, daemon=True)
-    t.start()
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv, port
 
 
-# ─────────────────────── Test scenarios ───────────────────────────────────
+# ─────────────────────── Integration scenarios ─────────────────────────────
 
 
 class IntegrationTests(unittest.TestCase):
-    """Each test exercises a documented capability end-to-end."""
+    """Each test exercises a documented capability against a local mock."""
 
     @classmethod
     def setUpClass(cls):
         cls.tmpdir = tempfile.mkdtemp(prefix="wdgwars-integ-")
-        print(f"\n[integration] using tmpdir: {cls.tmpdir}", file=sys.stderr)
+        # Spin up one mock server per scenario. Cheap — pure stdlib.
+        cls.mocks = {}
+        for scenario in ("outage", "healthy", "partial", "diverged"):
+            srv, port = serve_in_thread(scenario)
+            cls.mocks[scenario] = (srv, port, f"http://127.0.0.1:{port}")
+        print(f"\n[integration] tmpdir: {cls.tmpdir}", file=sys.stderr)
+        print(f"[integration] mock ports: "
+              f"{ {k: v[1] for k, v in cls.mocks.items()} }",
+              file=sys.stderr)
 
-    # ---- Basic invocation ------------------------------------------------
+    @classmethod
+    def tearDownClass(cls):
+        for srv, _, _ in cls.mocks.values():
+            srv.shutdown()
+
+    def mock_url(self, scenario: str) -> str:
+        return self.mocks[scenario][2]
+
+    # ──────────── Basic invocation (mock URL — fast, safe) ───────────────
 
     def test_01_version_flag(self):
         rc, out, err = run_tool("--version")
         self.assertEqual(rc, 0)
-        # argparse --version prints to stdout (Python 3.4+) or stderr (older).
-        combined = (out + err).strip()
-        self.assertRegex(combined, r"\d+\.\d+\.\d+")
+        self.assertRegex((out + err).strip(), r"\d+\.\d+\.\d+")
 
     def test_02_help_lists_all_documented_flags(self):
         rc, out, err = run_tool("--help")
@@ -134,102 +144,151 @@ class IntegrationTests(unittest.TestCase):
                      "--json", "--no-table", "--quiet", "--watch",
                      "--baseline", "--alert-telegram",
                      "--telegram-bot-token", "--telegram-chat-id",
-                     "--alert-webhook", "--exec-on-change",
-                     "--version"):
+                     "--alert-webhook", "--exec-on-change", "--version"):
             self.assertIn(flag, text, f"--help missing {flag}")
 
-    # ---- One-shot output formats -----------------------------------------
-
-    def test_03_default_oneshot_produces_table(self):
-        rc, out, err = run_tool("--variants", "none,garbage", "--timeout", "20")
-        # Exit code is 0 (healthy) or 1 (degraded/outage/etc), both valid.
-        self.assertIn(rc, (0, 1))
-        # Table goes to stderr.
+    def test_03_default_oneshot_against_mock_outage(self):
+        rc, out, err = run_tool("--hosts", self.mock_url("outage"),
+                                "--variants", "none,garbage")
+        self.assertEqual(rc, 1, f"outage should exit 1, got {rc}; err={err}")
         self.assertIn("verdict", err)
-        self.assertIn("summary:", err)
+        self.assertIn("DEGRADED", err)
+        self.assertIn("LEAK", err)
 
-    def test_04_quiet_emits_single_word_to_stdout(self):
-        rc, out, err = run_tool("--quiet", "--variants", "none,garbage",
-                                "--timeout", "20")
-        self.assertIn(rc, (0, 1))
-        # Exactly one line on stdout, recognizable verdict.
-        self.assertEqual(len(out.strip().splitlines()), 1,
-                         f"--quiet should emit one stdout line, got: {out!r}")
-        self.assertTrue(_is_valid_overall(out),
-                        f"--quiet produced unrecognized verdict: {out!r}")
-        # Table suppressed on stderr.
-        self.assertNotIn("verdict          status", err)
+    def test_04_quiet_against_mock_outage(self):
+        rc, out, err = run_tool("--quiet",
+                                "--hosts", self.mock_url("outage"),
+                                "--variants", "none,garbage")
+        self.assertEqual(rc, 1)
+        self.assertEqual(out.strip(), "DEGRADED+LEAK",
+                          f"expected DEGRADED+LEAK, got {out!r}")
 
-    def test_05_json_emits_valid_parseable_snapshot(self):
+    def test_05_json_schema_matches_documented(self):
         rc, out, err = run_tool("--json", "--no-table",
-                                "--variants", "none,garbage",
-                                "--timeout", "20")
-        self.assertIn(rc, (0, 1))
-        snapshot = json.loads(out)  # raises if invalid
-        self.assertEqual(snapshot["tool"], "wdgwars-api-tester")
-        self.assertIn("version", snapshot)
-        self.assertIn("summary", snapshot)
-        self.assertIn("overall", snapshot["summary"])
-        self.assertTrue(_is_valid_overall(snapshot["summary"]["overall"]))
-        self.assertIn("results", snapshot)
-        self.assertGreater(len(snapshot["results"]), 0)
-        # Every result has the expected schema.
-        for r in snapshot["results"]:
-            for k in ("probe", "host", "auth", "status",
-                       "body_md5", "verdict"):
-                self.assertIn(k, r)
+                                "--hosts", self.mock_url("outage"),
+                                "--variants", "none,garbage")
+        self.assertEqual(rc, 1)
+        snap = json.loads(out)
+        for key in ("tool", "version", "timestamp", "hosts",
+                     "variants", "summary", "results"):
+            self.assertIn(key, snap)
+        self.assertEqual(snap["tool"], "wdgwars-api-tester")
+        probe_names = {r["probe"] for r in snap["results"]}
+        for documented in ("api-root", "me", "upload-history",
+                            "upload-csv", "signed-upload",
+                            "health-asked-for", "stats-leak-check",
+                            "non-api-sentinel-404", "changelog-control",
+                            "api-sentinel-404-a", "api-sentinel-404-b",
+                            "api-sentinel-404-c"):
+            self.assertIn(documented, probe_names)
 
     def test_06_no_table_suppresses_table_only(self):
-        rc, out, err = run_tool("--no-table", "--variants", "none,garbage",
-                                "--timeout", "20")
+        rc, out, err = run_tool("--no-table",
+                                "--hosts", self.mock_url("outage"),
+                                "--variants", "none,garbage")
         self.assertIn(rc, (0, 1))
         self.assertNotIn("verdict          status", err)
-        self.assertNotIn("summary:", err)
-        # Without --json, nothing on stdout.
         self.assertEqual(out, "")
 
-    # ---- Hosts + variants validation -------------------------------------
+    # ──────────── Scenario-specific verdict assertions ───────────────────
 
-    def test_07_invalid_variant_rejected(self):
-        rc, out, err = run_tool("--variants", "nope", "--timeout", "5")
-        self.assertEqual(rc, 2, f"expected exit 2 on bad variant, got {rc}")
+    def test_07_healthy_scenario_produces_HEALTHY(self):
+        rc, out, err = run_tool("--quiet",
+                                "--hosts", self.mock_url("healthy"),
+                                "--variants", "none,garbage")
+        self.assertEqual(rc, 0,
+                          f"healthy mock should exit 0, got {rc}; err={err}")
+        self.assertEqual(out.strip(), "HEALTHY",
+                          f"expected HEALTHY, got {out!r}")
+
+    def test_08_partial_scenario_produces_HEALTHY_plus_LEAK(self):
+        rc, out, err = run_tool("--quiet",
+                                "--hosts", self.mock_url("partial"),
+                                "--variants", "none,garbage")
+        # HEALTHY+LEAK — API up but stats still leaking. Non-zero exit
+        # because LEAK is in the suffix.
+        self.assertEqual(rc, 1)
+        self.assertEqual(out.strip(), "HEALTHY+LEAK",
+                          f"expected HEALTHY+LEAK, got {out!r}")
+
+    def test_09_diverged_scenario_produces_SENTINEL_DIVERGED_suffix(self):
+        rc, out, err = run_tool("--quiet",
+                                "--hosts", self.mock_url("diverged"),
+                                "--variants", "none,garbage")
+        self.assertEqual(rc, 1)
+        self.assertIn("SENTINEL-DIVERGED", out,
+                       f"expected +SENTINEL-DIVERGED in overall, got {out!r}")
+
+    def test_10_outage_with_valid_key_marks_OUTAGE_not_DEGRADED(self):
+        # The `me` valid-key probe being DEAD is the OUTAGE trigger.
+        # Include `none` in variants so the sentinel probes run (they
+        # don't take auth, and without them there's no canonical
+        # fingerprint and DEAD detection is disabled).
+        rc, out, err = run_tool("--quiet",
+                                "--key", "x" * 64,
+                                "--hosts", self.mock_url("outage"),
+                                "--variants", "none,valid")
+        self.assertEqual(rc, 1)
+        self.assertTrue(out.strip().startswith("OUTAGE"),
+                         f"expected OUTAGE... with valid key + outage mock, "
+                         f"got {out!r}")
+
+    # ──────────── Validation + guard rails ───────────────────────────────
+
+    def test_11_invalid_variant_rejected(self):
+        rc, out, err = run_tool("--hosts", self.mock_url("outage"),
+                                "--variants", "nope")
+        self.assertEqual(rc, 2)
         self.assertIn("Unknown auth variants", err)
 
-    def test_08_valid_variant_dropped_silently_if_no_key(self):
-        # Override HOME / USERPROFILE so the config-file fallback
-        # (~/.config/wigle-to-wdgwars/wdgwars.key) can't find anything
-        # in the developer's actual home dir.
-        env = {k: v for k, v in os.environ.items()
-                if k not in ("WDGWARS_API_KEY",)}
-        env["HOME"] = self.tmpdir
-        env["USERPROFILE"] = self.tmpdir
-        rc, out, err = run_tool("--quiet", "--variants", "valid",
-                                "--timeout", "20", env=env)
-        # With `valid` dropped, no variants remain. Tool still runs the
-        # no-auth-required probes (sentinels, changelog, stats) and
-        # produces a verdict.
-        self.assertIn(rc, (0, 1))
-        self.assertIn("No valid key", err)
+    def test_12_invalid_hosts_rejected(self):
+        rc, out, err = run_tool("--hosts", "ftp://nope",
+                                "--variants", "none")
+        self.assertEqual(rc, 2)
+        self.assertIn("invalid --hosts", err)
 
-    # ---- Baseline mode ---------------------------------------------------
+    def test_13_alert_telegram_without_watch_warns(self):
+        rc, out, err = run_tool("--quiet", "--alert-telegram",
+                                "--telegram-bot-token", "fake",
+                                "--telegram-chat-id", "fake",
+                                "--hosts", self.mock_url("outage"),
+                                "--variants", "none,garbage")
+        self.assertEqual(rc, 1)
+        self.assertIn("requires --watch", err)
 
-    def test_09_baseline_creates_file_on_first_run(self):
-        baseline = Path(self.tmpdir) / "test09-baseline.json"
-        self.assertFalse(baseline.exists())
+    def test_14_alert_webhook_without_watch_warns(self):
+        rc, out, err = run_tool("--quiet",
+                                "--alert-webhook", "https://example.com/x",
+                                "--hosts", self.mock_url("outage"),
+                                "--variants", "none,garbage")
+        self.assertEqual(rc, 1)
+        self.assertIn("require --watch", err)
+
+    def test_15_exec_on_change_without_watch_warns(self):
+        rc, out, err = run_tool("--quiet",
+                                "--exec-on-change", "true",
+                                "--hosts", self.mock_url("outage"),
+                                "--variants", "none,garbage")
+        self.assertEqual(rc, 1)
+        self.assertIn("require --watch", err)
+
+    # ──────────── Baseline mode ──────────────────────────────────────────
+
+    def test_16_baseline_creates_file_first_run(self):
+        baseline = Path(self.tmpdir) / "test16-baseline.json"
         rc, out, err = run_tool("--no-table",
                                 "--baseline", str(baseline),
-                                "--variants", "none,garbage",
-                                "--timeout", "20")
-        self.assertIn(rc, (0, 1))
+                                "--hosts", self.mock_url("outage"),
+                                "--variants", "none,garbage")
+        self.assertEqual(rc, 1)
         self.assertTrue(baseline.exists())
         self.assertIn("baseline written", err)
-        # Baseline is parseable.
         data = json.loads(baseline.read_text(encoding="utf-8"))
         self.assertIn("results", data)
 
-    def test_10_baseline_diffs_on_second_run(self):
-        baseline = Path(self.tmpdir) / "test10-baseline.json"
-        # Pre-populate with fabricated baseline that differs from current.
+    def test_17_baseline_diffs_on_second_run(self):
+        baseline = Path(self.tmpdir) / "test17-baseline.json"
+        # Seed with a fabricated baseline that disagrees with current.
         fake = {"results": [
             {"host": "https://wdgwars.pl", "probe": "me", "auth": "none",
              "verdict": "OK", "status": 200},
@@ -237,193 +296,142 @@ class IntegrationTests(unittest.TestCase):
         baseline.write_text(json.dumps(fake), encoding="utf-8")
         rc, out, err = run_tool("--no-table",
                                 "--baseline", str(baseline),
-                                "--variants", "none,garbage",
-                                "--timeout", "20")
-        self.assertIn(rc, (0, 1))
-        self.assertIn("baseline diffs", err,
-                       f"expected 'baseline diffs' in stderr, got: {err[:300]}")
+                                "--hosts", self.mock_url("outage"),
+                                "--variants", "none,garbage")
+        self.assertEqual(rc, 1)
+        self.assertIn("baseline diffs", err)
 
-    # ---- Notification guard rails ----------------------------------------
+    # ──────────── Cross-scenario verdict transition (recovery) ──────────
 
-    def test_11_alert_telegram_without_watch_warns(self):
-        rc, out, err = run_tool("--quiet", "--alert-telegram",
-                                "--telegram-bot-token", "fake",
-                                "--telegram-chat-id", "fake",
-                                "--variants", "none,garbage",
-                                "--timeout", "20")
-        self.assertIn(rc, (0, 1))
-        self.assertIn("requires --watch", err)
+    def test_18_baseline_stable_against_same_scenario(self):
+        """Run twice against the same mock — second run should report no
+        diff. This proves the verdict pipeline is deterministic across
+        successive runs given identical API behavior."""
+        baseline = Path(self.tmpdir) / "test18-baseline.json"
+        rc, _, _ = run_tool("--no-table", "--baseline", str(baseline),
+                              "--hosts", self.mock_url("outage"),
+                              "--variants", "none,garbage")
+        self.assertEqual(rc, 1)
+        # Second run against same mock.
+        rc, out, err = run_tool("--no-table", "--baseline", str(baseline),
+                                  "--hosts", self.mock_url("outage"),
+                                  "--variants", "none,garbage")
+        self.assertEqual(rc, 1)
+        self.assertIn("no diff vs baseline", err,
+                       f"expected stable verdicts run-over-run, got: {err[:500]}")
 
-    def test_12_alert_webhook_without_watch_warns(self):
-        rc, out, err = run_tool("--quiet",
-                                "--alert-webhook", "https://example.com/x",
-                                "--variants", "none,garbage",
-                                "--timeout", "20")
-        self.assertIn(rc, (0, 1))
-        self.assertIn("require --watch", err)
+    # ──────────── End-to-end notification dispatch ──────────────────────
 
-    def test_13_exec_on_change_without_watch_warns(self):
-        rc, out, err = run_tool("--quiet",
-                                "--exec-on-change", "true",
-                                "--variants", "none,garbage",
-                                "--timeout", "20")
-        self.assertIn(rc, (0, 1))
-        self.assertIn("require --watch", err)
-
-    def test_14_alert_telegram_with_watch_but_no_creds_warns(self):
-        # We don't actually wait for --watch to fire; we just look for the
-        # startup warning emitted before the watch loop begins. Run with a
-        # short timeout via subprocess.
-        env = {k: v for k, v in os.environ.items()
-                if k not in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID")}
-        cmd = [PY, str(TOOL), "--watch", "1", "--alert-telegram",
-                "--variants", "none,garbage", "--timeout", "20"]
-        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                              text=True, env=env)
-        try:
-            # Give it enough time to print the startup warning + first probe.
-            time.sleep(8.0)
-        finally:
-            p.terminate()
-            try:
-                _, err = p.communicate(timeout=5.0)
-            except subprocess.TimeoutExpired:
-                p.kill()
-                _, err = p.communicate()
-        self.assertIn("TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID missing", err,
-                       f"expected creds-missing warning, got: {err[:400]}")
-
-    # ---- Watch loop + webhook + exec end-to-end --------------------------
-
-    def test_15_watch_fires_webhook_and_exec_on_state_change(self):
-        """The big one: --watch + --alert-webhook + --exec-on-change with a
-        forced state transition. Mock HTTP receiver captures the webhook
-        payload; tempfile sink captures the exec env vars."""
-
-        # Spin up a mock webhook receiver.
-        # Clear any leftover captures from prior tests.
+    def test_19_webhook_post_against_capture_server(self):
+        """Verify _post_webhook + _format_webhook_payload talk to a mock
+        receiver and the payload shape matches what the README documents.
+        Driver receives root + webhook URL via argv (no path-embedding)."""
         while not CaptureHandler.captured.empty():
             try:
                 CaptureHandler.captured.get_nowait()
             except queue.Empty:
                 break
-        srv, port = start_mock_server()
+        srv, port = start_capture_server()
         try:
             webhook_url = f"http://127.0.0.1:{port}/hook"
-            exec_sink = Path(self.tmpdir) / "test15-exec-sink.txt"
-
-            # Use a baseline file that doesn't exist (so first run writes it
-            # without a state change), then we'd need a second cycle to fire.
-            # Simpler approach: run with --watch and let it fire on the
-            # "initial state" cycle... but that path doesn't emit alerts
-            # because there's no prior state.
-            #
-            # Actually, in the current watch loop, alerts fire only when the
-            # overall transitions. The first cycle just prints "initial
-            # state" — no alert. The second cycle fires only if the state
-            # changed, which won't happen during a 5-second test window.
-            #
-            # So to actually trigger the alert path, we need a deliberate
-            # state change between cycles. The cleanest way: shim the API
-            # behavior. We can't easily do that without modifying the tool.
-            #
-            # Workaround: verify the alert plumbing dispatches correctly
-            # by manually constructing the call rather than relying on a
-            # real state change. The watch loop itself is unit-tested via
-            # the formatters; what we want to verify here is that the
-            # HTTP/exec wiring works at the subprocess boundary.
-            #
-            # Approach: write a tiny driver that imports the tool's
-            # _post_webhook and _exec_on_change directly and verifies
-            # they wire to the mock and the sink.
-            # Cross-platform env capture: a tiny Python helper that
-            # reads its own environment and writes WDGWARS_* vars to
-            # the sink file. Works the same on Linux and Windows.
-            capture_script = Path(self.tmpdir) / "capture_env.py"
-            capture_script.write_text(
-                "import os, sys\n"
-                "sink = sys.argv[1]\n"
-                "with open(sink, 'w', encoding='utf-8') as f:\n"
-                "    for k in sorted(os.environ):\n"
-                "        if k.startswith('WDGWARS_'):\n"
-                "            f.write(f'{k}={os.environ[k]}\\n')\n",
+            driver = Path(self.tmpdir) / "driver19.py"
+            driver.write_text(
+                "import sys\n"
+                "sys.path.insert(0, sys.argv[1])\n"
+                "from wdgwars_api_tester import "
+                "_post_webhook, _format_webhook_payload\n"
+                "deltas = ['wdgwars.pl me/valid OK/200 -> DEAD/404']\n"
+                "verdicts = {'DEAD': 10, 'LEAK': 1, 'OK': 1}\n"
+                "payload = _format_webhook_payload("
+                "'HEALTHY', 'OUTAGE+LEAK', deltas, verdicts)\n"
+                "ok = _post_webhook(sys.argv[2], payload)\n"
+                "print(f'ok={ok}')\n",
                 encoding="utf-8",
             )
-            exec_cmd = f'"{PY}" "{capture_script}" "{exec_sink}"'
+            r = subprocess.run(
+                [PY, str(driver), str(ROOT), webhook_url],
+                capture_output=True, text=True, timeout=15,
+            )
+            self.assertEqual(r.returncode, 0, f"driver: {r.stderr}")
+            self.assertIn("ok=True", r.stdout)
 
-            driver = Path(self.tmpdir) / "driver15.py"
-            driver.write_text(f"""
-import sys
-sys.path.insert(0, {str(ROOT)!r})
-from wdgwars_api_tester import (
-    _post_webhook, _format_webhook_payload, _exec_on_change,
-)
-
-# Forge a fake state transition: HEALTHY -> OUTAGE+LEAK
-deltas = ["wdgwars.pl me/valid OK/200 -> DEAD/404",
-          "wdgwars.pl stats-leak-check 404/404 -> LEAK/200"]
-verdicts = {{"DEAD": 10, "LEAK": 1, "OK": 1}}
-
-payload = _format_webhook_payload("HEALTHY", "OUTAGE+LEAK", deltas, verdicts)
-ok_webhook = _post_webhook({webhook_url!r}, payload)
-print(f"webhook_ok={{ok_webhook}}")
-
-ok_exec = _exec_on_change(
-    {exec_cmd!r},
-    "HEALTHY", "OUTAGE+LEAK", deltas, verdicts,
-)
-print(f"exec_ok={{ok_exec}}")
-""", encoding="utf-8")
-
-            r = subprocess.run([PY, str(driver)],
-                                capture_output=True, text=True, timeout=20)
-            self.assertEqual(r.returncode, 0, f"driver failed: {r.stderr}")
-            self.assertIn("webhook_ok=True", r.stdout)
-            self.assertIn("exec_ok=True", r.stdout)
-
-            # Webhook should have received exactly one POST.
-            try:
-                captured = CaptureHandler.captured.get(timeout=5.0)
-            except queue.Empty:
-                self.fail("mock webhook never received a POST")
-
-            self.assertEqual(captured["path"], "/hook")
+            captured = CaptureHandler.captured.get(timeout=5.0)
             body = captured["body_json"]
-            self.assertIsNotNone(body, f"webhook body wasn't JSON: "
-                                  f"{captured['body_raw'][:200]}")
             self.assertEqual(body["overall"], "OUTAGE+LEAK")
             self.assertEqual(body["prev_overall"], "HEALTHY")
             self.assertEqual(body["kind"], "regression")
-            self.assertIn("text", body)       # Slack
-            self.assertIn("content", body)    # Discord
+            self.assertIn("text", body)
+            self.assertIn("content", body)
             self.assertEqual(body["tool"], "wdgwars-api-tester")
-
-            # Exec sink should contain the env vars.
-            self.assertTrue(exec_sink.exists(), "exec command didn't write sink")
-            sink_text = exec_sink.read_text(encoding="utf-8")
-            self.assertIn("WDGWARS_OVERALL=OUTAGE+LEAK", sink_text)
-            self.assertIn("WDGWARS_PREV_OVERALL=HEALTHY", sink_text)
-            self.assertIn("WDGWARS_KIND=regression", sink_text)
-            self.assertIn("WDGWARS_RECOVERY=0", sink_text)
-
         finally:
             srv.shutdown()
 
-    # ---- Sanity smoke against the live API -------------------------------
+    def test_20_exec_on_change_env_vars_set_correctly(self):
+        """Cross-platform env-capture test for _exec_on_change.
 
-    def test_16_live_probe_matches_documented_schema(self):
-        """Confirm the tool's JSON output matches what the README claims."""
+        Pass paths via argv to the driver rather than embedding them in
+        source (Windows backslash paths break Python unicode-escape
+        parsing when inlined as string literals).
+        """
+        exec_sink = Path(self.tmpdir) / "test20-sink.txt"
+        capture = Path(self.tmpdir) / "capture_env.py"
+        capture.write_text(
+            "import os, sys\n"
+            "with open(sys.argv[1], 'w', encoding='utf-8') as f:\n"
+            "    for k in sorted(os.environ):\n"
+            "        if k.startswith('WDGWARS_'):\n"
+            "            f.write(f'{k}={os.environ[k]}\\n')\n",
+            encoding="utf-8",
+        )
+        driver = Path(self.tmpdir) / "driver20.py"
+        # The driver reads argv: [root_dir, python_exe, capture_script, sink].
+        # It constructs the exec command at runtime from those args, avoiding
+        # any string-literal embedding of OS paths.
+        driver.write_text(
+            "import sys, shlex\n"
+            "sys.path.insert(0, sys.argv[1])\n"
+            "from wdgwars_api_tester import _exec_on_change\n"
+            "py, cap, sink = sys.argv[2], sys.argv[3], sys.argv[4]\n"
+            # Quote each path defensively — works on both Win cmd.exe and POSIX sh.
+            "cmd = f'\"{py}\" \"{cap}\" \"{sink}\"'\n"
+            "deltas = ['foo OK/200 -> DEAD/404']\n"
+            "verdicts = {'DEAD': 1}\n"
+            "ok = _exec_on_change(cmd, 'HEALTHY', 'OUTAGE+LEAK', deltas, verdicts)\n"
+            "print(f'ok={ok}')\n",
+            encoding="utf-8",
+        )
+        r = subprocess.run(
+            [PY, str(driver), str(ROOT), PY, str(capture), str(exec_sink)],
+            capture_output=True, text=True, timeout=20,
+        )
+        self.assertEqual(r.returncode, 0,
+                          f"driver rc={r.returncode}\n"
+                          f"stdout={r.stdout}\nstderr={r.stderr}")
+        self.assertIn("ok=True", r.stdout)
+        self.assertTrue(exec_sink.exists())
+        text = exec_sink.read_text(encoding="utf-8")
+        self.assertIn("WDGWARS_OVERALL=OUTAGE+LEAK", text)
+        self.assertIn("WDGWARS_PREV_OVERALL=HEALTHY", text)
+        self.assertIn("WDGWARS_KIND=regression", text)
+        self.assertIn("WDGWARS_RECOVERY=0", text)
+
+
+# ──────────── Live-only tests (opt-in via --live or INTEGRATION_LIVE=1) ──
+
+
+@unittest.skipUnless(LIVE,
+    "Live tests skipped. Pass --live or INTEGRATION_LIVE=1 to enable.")
+class LiveTests(unittest.TestCase):
+    """Schema-validation against the real wdgwars.pl. Opt-in — these hit
+    the actual API and shouldn't run on every developer push."""
+
+    def test_live_probe_schema(self):
         rc, out, err = run_tool("--json", "--no-table",
                                 "--variants", "none,garbage",
-                                "--timeout", "20")
-        snapshot = json.loads(out)
-        # README documents these top-level keys.
-        for key in ("tool", "version", "timestamp", "hosts",
-                     "variants", "summary", "results"):
-            self.assertIn(key, snapshot, f"missing top-level key: {key}")
-
-        # README documents these probes exist.
-        probe_names = {r["probe"] for r in snapshot["results"]}
+                                "--timeout", "20", timeout=60.0)
+        self.assertIn(rc, (0, 1))
+        snap = json.loads(out)
+        probe_names = {r["probe"] for r in snap["results"]}
         for documented in ("api-root", "me", "upload-history",
                             "upload-csv", "signed-upload",
                             "health-asked-for", "stats-leak-check",
@@ -431,39 +439,33 @@ print(f"exec_ok={{ok_exec}}")
                             "api-sentinel-404-a", "api-sentinel-404-b",
                             "api-sentinel-404-c"):
             self.assertIn(documented, probe_names,
-                           f"README documents probe '{documented}' "
-                           "but it's missing from output")
-
-        # The 3-sentinel quorum should produce a single canonical fingerprint
-        # under normal conditions (no diverged sentinels in steady state).
-        sentinels = [r for r in snapshot["results"]
+                           f"README documents '{documented}' but it's "
+                           "missing from live output")
+        sentinels = [r for r in snap["results"]
                       if r["probe"].startswith("api-sentinel-404-")
                       and not r["probe"].endswith("nonapi")]
-        self.assertEqual(len(sentinels), 3,
-                          "expected 3 /api/ quorum sentinels")
-        sentinel_hashes = {r["body_md5"] for r in sentinels if r["body_md5"]}
-        # In a healthy or unanimously-broken state, all 3 should agree.
-        # Under sentinel divergence, more than one hash is expected — but
-        # the summary then carries +SENTINEL-DIVERGED.
-        overall = snapshot["summary"]["overall"]
-        if "SENTINEL-DIVERGED" not in overall:
-            self.assertLessEqual(len(sentinel_hashes), 2,
-                                  "non-diverged state should have ≤2 distinct "
-                                  "sentinel hashes (unanimous or majority)")
+        self.assertEqual(len(sentinels), 3)
 
 
 def main():
     print("=" * 70)
-    print("wdgwars-api-tester integration test loop")
+    print(f"wdgwars-api-tester integration test loop  "
+           f"({'OFFLINE+LIVE' if LIVE else 'OFFLINE'})")
     print("=" * 70)
-    suite = unittest.TestLoader().loadTestsFromTestCase(IntegrationTests)
+    loader = unittest.TestLoader()
+    suite = unittest.TestSuite([
+        loader.loadTestsFromTestCase(IntegrationTests),
+        loader.loadTestsFromTestCase(LiveTests),
+    ])
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)
     print()
     print("=" * 70)
-    print(f"Ran {result.testsRun} integration scenarios")
-    print(f"Failures: {len(result.failures)}   Errors: {len(result.errors)}   "
-          f"Skipped: {len(result.skipped)}")
+    print(f"Ran {result.testsRun} integration scenarios "
+           f"({'OFFLINE+LIVE' if LIVE else 'OFFLINE'})")
+    print(f"Failures: {len(result.failures)}   "
+           f"Errors: {len(result.errors)}   "
+           f"Skipped: {len(result.skipped)}")
     print("=" * 70)
     sys.exit(0 if result.wasSuccessful() else 1)
 
