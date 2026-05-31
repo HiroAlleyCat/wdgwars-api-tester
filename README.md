@@ -84,7 +84,7 @@ If no key is found, the `valid` variant is dropped automatically and only the
 | `leaderboard` | GET | `/api/leaderboard` | yes | 5 boards. 5-min snapshot. |
 | `bounties` | GET | `/api/bounties` | yes | Open bounties (max 200). |
 | `health-asked-for` | GET | `/api/health` | no | Doesn't exist yet. Asked for in bug #1. |
-| `stats-leak-check` | GET | `/api/stats` | no | 200 here = LiteSpeed admin leak. |
+| `stats-leak-check` | GET | `/api/stats` | no | Fires LEAK if body carries the LSWS admin-telemetry fingerprint. (locosp's 2026-05-30 fix landed — endpoint now 302s to login; rule tightened in v0.6.1 to detect content, not just status.) |
 | `api-sentinel-404-a/b/c` | GET | `/api/<random>` × 3 | no | Quorum fingerprint of the /api/ 404 page (2-of-3 majority required). |
 | `non-api-sentinel-404` | GET | `/<random>` | no | Fingerprints the non-/api/ 404 page. |
 | `changelog-control` | GET | `/changelog` | no | Public-page reachability control. |
@@ -94,11 +94,12 @@ If no key is found, the `valid` variant is dropped automatically and only the
 | Verdict | Meaning |
 |---|---|
 | `OK` | 2xx response, body distinct from any 404 sentinel. |
-| `AUTH-REQUIRED` | 401. Endpoint is alive and rejecting the key. |
+| `AUTH-REQUIRED` | 401. Endpoint is alive and rejecting the key with the spec-correct JSON shape. |
+| `AUTH-REDIRECT` | 3xx whose `Location` points at `/login...`. The auth gate is working, but the endpoint is wired through the web-session flow rather than returning 401 JSON — a routing-shape regression for an API caller, but not a security/availability issue. Does NOT escalate to DEGRADED. |
+| `REDIRECT-{n}` | 3xx whose `Location` does not match `/login` (catch-all so unexpected redirects don't masquerade as OK). |
 | `DEAD` | Body hash matches the /api/ 404 quorum sentinel. Route not bound. |
 | `DEAD-NONAPI` | Body matches the non-/api/ 404 sentinel. |
-| `LEAK` | `/api/stats` returned 200 → LiteSpeed admin telemetry exposed. |
-| `BLOCKED` | `/api/stats` returned non-200. Desired state for that endpoint, regardless of which 404 handler served it. |
+| `LEAK` | Body carries the LiteSpeed admin-telemetry fingerprint (`lsphp_processes` / `top_domains` / `lsphp`). Generalized in v0.6.1 — fires on any probe, not just `stats-leak-check`. Tightened from "stats returned 200" because the bare-status rule false-positived once locosp's 2026-05-30 fix landed and `/api/stats` started 302ing to `/login`. |
 | `404` | 404 response but body distinct from sentinels. |
 | `METHOD` | 405. Healthy endpoint, wrong verb. |
 | `ERROR` | Network/timeout/URL error. |

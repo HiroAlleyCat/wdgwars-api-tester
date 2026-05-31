@@ -25,7 +25,7 @@ Quickstart:
 """
 from __future__ import annotations
 
-__version__ = "0.6.0"
+__version__ = "0.6.1"
 GITHUB_URL = "https://github.com/HiroAlleyCat/wdgwars-api-tester"
 
 import argparse
@@ -51,6 +51,33 @@ ALL_HOSTS = ["https://wdgwars.pl", "https://www.wdgwars.pl", "https://api.wdgwar
 
 GARBAGE_KEY = "g" * 64
 AUTH_VARIANTS = ("none", "garbage", "valid")
+
+# Fingerprint for the LiteSpeed admin-telemetry leak that 2026-05-29's bug
+# report flagged on /api/stats. The leak's distinctive content always
+# carries at least one of these substrings — both are LSWS field names that
+# would never appear in a normal API response or auth-redirect login page.
+# This list is the LEAK verdict's gate; bare HTTP 200 on stats-leak-check
+# is no longer enough (locosp's fix landed and the endpoint now 302s to
+# /login, which would false-positive on a status-only rule).
+LSWS_LEAK_FINGERPRINTS = ("lsphp_processes", "top_domains", "lsphp")
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """urllib's default behavior is to silently follow 3xx responses, which
+    would mask the route's actual shape — a /api/<endpoint> path that 302s
+    to /login is meaningfully different from one that 200s directly. We
+    want the 3xx to surface so verdict logic can label it AUTH-REDIRECT.
+
+    Returning None from redirect_request signals "do not redirect"; urllib
+    then raises HTTPError with the original 3xx code, which the existing
+    HTTPError handler catches.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirectHandler())
 
 if not logging.getLogger().handlers:
     logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stderr)
@@ -192,6 +219,18 @@ class Result:
     server: str
     error: str = ""
     verdict: str = ""  # set after sentinel comparison
+    # New in v0.6.1. `location` is the raw Location header on 3xx responses
+    # (empty on 2xx/4xx/5xx). `body_excerpt` is the first 200 chars of the
+    # response body, decoded with errors="replace", for human debugging
+    # from the JSON snapshot (excerpt-only — do NOT treat as the full
+    # body). `leak_marker` is empty unless the LSWS admin-telemetry
+    # fingerprint was found anywhere in the full body — set to the first
+    # matched substring; verdict logic uses it directly to fire LEAK.
+    # Decoupled from body_excerpt because the leak fingerprint may sit
+    # past the first 200 chars (e.g. inside a pretty-printed JSON dict).
+    location: str = ""
+    body_excerpt: str = ""
+    leak_marker: str = ""
 
 
 def _v2_upload_csv_round_trip(probe: Probe, host: str, auth: str,
@@ -235,7 +274,7 @@ def _v2_upload_csv_round_trip(probe: Probe, host: str, auth: str,
     err = ""
 
     try:
-        with urllib.request.urlopen(post_req, timeout=timeout) as resp:
+        with _OPENER.open(post_req, timeout=timeout) as resp:
             status = resp.status
             body = resp.read(1024 * 1024)
             resp_headers = {k.lower(): v for k, v in resp.headers.items()}
@@ -285,7 +324,7 @@ def _v2_upload_csv_round_trip(probe: Probe, host: str, auth: str,
                 poll_url, headers=headers, method="GET",
             )
             try:
-                with urllib.request.urlopen(poll_req, timeout=timeout) as resp:
+                with _OPENER.open(poll_req, timeout=timeout) as resp:
                     last_poll_status = resp.status
                     last_poll_body = resp.read(1024 * 1024)
                     last_poll_headers = {k.lower(): v
@@ -350,6 +389,12 @@ def _v2_upload_csv_round_trip(probe: Probe, host: str, auth: str,
         x_request_id=resp_headers.get("x-request-id", ""),
         server=resp_headers.get("server", ""),
         error=err,
+        location=resp_headers.get("location", ""),
+        body_excerpt=body[:200].decode("utf-8", "replace") if body else "",
+        leak_marker=next(
+            (f for f in LSWS_LEAK_FINGERPRINTS if f.encode() in body),
+            "",
+        ),
     )
 
 
@@ -377,7 +422,7 @@ def _request(probe: Probe, host: str, auth: str, valid_key: Optional[str],
     resp_headers: dict[str, str] = {}
     err = ""
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _OPENER.open(req, timeout=timeout) as resp:
             status = resp.status
             body = resp.read(1024 * 1024)  # cap at 1 MiB, plenty for diagnostics
             resp_headers = {k.lower(): v for k, v in resp.headers.items()}
@@ -412,6 +457,12 @@ def _request(probe: Probe, host: str, auth: str, valid_key: Optional[str],
         x_request_id=resp_headers.get("x-request-id", ""),
         server=resp_headers.get("server", ""),
         error=err,
+        location=resp_headers.get("location", ""),
+        body_excerpt=body[:200].decode("utf-8", "replace") if body else "",
+        leak_marker=next(
+            (f for f in LSWS_LEAK_FINGERPRINTS if f.encode() in body),
+            "",
+        ),
     )
 
 
@@ -482,6 +533,17 @@ def annotate_verdicts(results: list[Result]) -> None:
         if r.error:
             r.verdict = "ERROR"
             continue
+        # LEAK fires on any probe whose body carries the LiteSpeed admin-
+        # telemetry fingerprint, regardless of which endpoint received
+        # the request. Was probe-specific (stats-leak-check) until v0.6.1;
+        # generalized so the rule catches the case where the leak expands
+        # to additional /api/* paths in the future. Tightened from
+        # "stats-leak-check returned 200" because locosp's 2026-05-30 fix
+        # landed and the bare-status rule was false-positiving on the
+        # post-fix 302→/login redirect target.
+        if r.leak_marker:
+            r.verdict = "LEAK"
+            continue
         api_md5, quorum_status = canonical.get(r.host, ("", "no-data"))
         nas = non_api_sentinels.get(r.host, "")
 
@@ -494,17 +556,22 @@ def annotate_verdicts(results: list[Result]) -> None:
                 r.verdict = "SENTINEL"
         elif r.probe == "non-api-sentinel-404":
             r.verdict = "SENTINEL-NONAPI"
-        elif r.probe == "stats-leak-check":
-            # 200 = LeakSpeed admin telemetry exposed. Any non-200 =
-            # endpoint is suppressed, which is the desired state. We do
-            # not want to label this DEAD just because it happens to
-            # return the same body as the /api/ unbound fallback — that
-            # would degrade the summary on a correctly-blocked endpoint.
-            r.verdict = "LEAK" if r.status == 200 else "BLOCKED"
-        elif r.body_md5 and api_md5 and r.body_md5 == api_md5:
+        if r.verdict:
+            continue
+        if r.body_md5 and api_md5 and r.body_md5 == api_md5:
             r.verdict = "DEAD"
         elif r.body_md5 and nas and r.body_md5 == nas:
             r.verdict = "DEAD-NONAPI"
+        elif r.status in (301, 302, 303, 307, 308) and "/login" in (r.location or ""):
+            # API endpoint redirecting to the web-session login flow.
+            # Distinct from AUTH-REQUIRED (which is the spec-correct 401
+            # JSON shape). Routing inconsistency in WDGoWars: some /api/*
+            # paths return 401 JSON, others 302→login HTML. We surface it
+            # without escalating to DEGRADED — the auth gate is working,
+            # the response shape just isn't API-clean.
+            r.verdict = "AUTH-REDIRECT"
+        elif r.status in (301, 302, 303, 307, 308):
+            r.verdict = f"REDIRECT-{r.status}"
         elif r.status == 401:
             r.verdict = "AUTH-REQUIRED"
         elif 200 <= r.status < 300:
@@ -525,8 +592,10 @@ def annotate_verdicts(results: list[Result]) -> None:
 
 VERDICT_PRIORITY = {
     "ERROR": 0, "SENTINEL-DIVERGED": 1, "LEAK": 2, "DEAD": 3, "DEAD-NONAPI": 4,
-    "SENTINEL-OUTLIER": 5, "404": 6, "METHOD": 7, "AUTH-REQUIRED": 8, "OK": 9,
-    "BLOCKED": 10, "SENTINEL": 11, "SENTINEL-NONAPI": 12,
+    "SENTINEL-OUTLIER": 5, "404": 6, "METHOD": 7,
+    "REDIRECT-301": 8, "REDIRECT-303": 8, "REDIRECT-307": 8, "REDIRECT-308": 8,
+    "AUTH-REQUIRED": 9, "AUTH-REDIRECT": 10, "OK": 11,
+    "BLOCKED": 12, "SENTINEL": 13, "SENTINEL-NONAPI": 14,
 }
 
 

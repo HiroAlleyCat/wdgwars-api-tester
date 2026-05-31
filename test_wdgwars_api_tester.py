@@ -25,18 +25,24 @@ from wdgwars_api_tester import (
 
 
 def _r(probe, host="https://wdgwars.pl", auth="none", status=200, body_md5="",
-       error="", body_len=0) -> Result:
+       error="", body_len=0, location="", leak_marker="") -> Result:
     return Result(
         probe=probe, host=host, auth=auth, method="GET",
         url=host + "/" + probe, status=status,
         elapsed_ms=10, body_len=body_len, body_md5=body_md5,
         content_type="text/html", cf_cache_status="", x_request_id="",
-        server="", error=error,
+        server="", error=error, location=location, leak_marker=leak_marker,
     )
 
 
 def _outage_fixture(host="https://wdgwars.pl") -> list[Result]:
-    """A realistic outage snapshot: 3 unanimous sentinels, all probes DEAD."""
+    """A realistic outage snapshot: 3 unanimous sentinels, all probes DEAD.
+
+    `stats-leak-check` carries a `leak_marker` reflecting the LSWS admin
+    telemetry fingerprint that the v0.5.x outage exposed — the v0.6.1
+    LEAK rule reads this field, not just status, so fixtures need to
+    set it explicitly to reproduce the original "DEGRADED+LEAK" state.
+    """
     dead = "543951d5e64c80ff543951d5e64c80ff"
     return [
         _r("api-sentinel-404-a", host=host, status=404, body_md5=dead, body_len=919),
@@ -46,7 +52,8 @@ def _outage_fixture(host="https://wdgwars.pl") -> list[Result]:
         _r("me", host=host, auth="valid", status=404, body_md5=dead, body_len=919),
         _r("me", host=host, auth="none", status=404, body_md5=dead, body_len=919),
         _r("upload-history", host=host, auth="valid", status=404, body_md5=dead, body_len=919),
-        _r("stats-leak-check", host=host, status=200, body_md5="c08def88", body_len=981),
+        _r("stats-leak-check", host=host, status=200, body_md5="c08def88",
+            body_len=981, leak_marker="lsphp_processes"),
         _r("changelog-control", host=host, status=200, body_md5="3f6a4dc0", body_len=32803),
     ]
 
@@ -167,6 +174,68 @@ class TestAnnotateVerdicts(unittest.TestCase):
         annotate_verdicts(results)
         self.assertEqual(results[0].verdict, "ERROR")
 
+    # ───────── v0.6.1 — AUTH-REDIRECT / tightened LEAK / redirects ─────────
+
+    def test_auth_redirect_when_302_to_login(self):
+        results = [
+            _r("api-sentinel-404-a", status=404, body_md5="d"),
+            _r("api-sentinel-404-b", status=404, body_md5="d"),
+            _r("api-sentinel-404-c", status=404, body_md5="d"),
+            _r("aircraft", auth="none", status=302, body_md5="",
+                location="/login/?next=%2Fendpoint%2Faircraft"),
+        ]
+        annotate_verdicts(results)
+        ac = next(r for r in results if r.probe == "aircraft")
+        self.assertEqual(ac.verdict, "AUTH-REDIRECT")
+
+    def test_redirect_fallback_when_not_login(self):
+        # A 3xx whose Location does NOT point at /login is labeled with
+        # the bare code so operators see it but it doesn't get mistaken
+        # for the WDGoWars-specific auth-redirect pattern.
+        results = [
+            _r("api-sentinel-404-a", status=404, body_md5="d"),
+            _r("api-sentinel-404-b", status=404, body_md5="d"),
+            _r("api-sentinel-404-c", status=404, body_md5="d"),
+            _r("me", auth="none", status=301, body_md5="",
+                location="https://elsewhere.example/"),
+        ]
+        annotate_verdicts(results)
+        me = next(r for r in results if r.probe == "me")
+        self.assertEqual(me.verdict, "REDIRECT-301")
+
+    def test_leak_fires_on_any_probe_with_leak_marker(self):
+        # v0.6.1 generalized LEAK away from probe-specific. Any probe
+        # whose body carries the LSWS fingerprint now fires LEAK — that
+        # catches the case where the leak expands to additional /api/*
+        # paths in the future.
+        results = [
+            _r("api-sentinel-404-a", status=404, body_md5="d"),
+            _r("api-sentinel-404-b", status=404, body_md5="d"),
+            _r("api-sentinel-404-c", status=404, body_md5="d"),
+            _r("aircraft", auth="none", status=200, body_md5="ack",
+                leak_marker="lsphp"),
+        ]
+        annotate_verdicts(results)
+        ac = next(r for r in results if r.probe == "aircraft")
+        self.assertEqual(ac.verdict, "LEAK")
+
+    def test_stats_leak_check_with_login_redirect_does_not_fire_leak(self):
+        # The 2026-05-30 false-positive case in one test: stats returns
+        # 200/HTML (login page) without the LSWS fingerprint → must not
+        # be labeled LEAK. AUTH-REDIRECT is the right call when the 302
+        # is preserved; OK is acceptable if urllib followed silently.
+        results = [
+            _r("api-sentinel-404-a", status=404, body_md5="d"),
+            _r("api-sentinel-404-b", status=404, body_md5="d"),
+            _r("api-sentinel-404-c", status=404, body_md5="d"),
+            _r("stats-leak-check", auth="none", status=302, body_md5="",
+                location="/login/?next=%2Fendpoint%2Fstats"),
+        ]
+        annotate_verdicts(results)
+        stats = next(r for r in results if r.probe == "stats-leak-check")
+        self.assertEqual(stats.verdict, "AUTH-REDIRECT")
+        self.assertNotIn("LEAK", [r.verdict for r in results])
+
 
 class TestSummary(unittest.TestCase):
     def test_outage_when_valid_me_dead(self):
@@ -186,13 +255,21 @@ class TestSummary(unittest.TestCase):
                         f"expected DEGRADED, got {s['overall']}")
 
     def test_healthy_when_no_dead_no_leak_no_error(self):
+        # stats-leak-check carries a body_md5 distinct from the sentinel:
+        # post-2026-05-30 the endpoint 302s to /login (or returns a non-
+        # leak body), neither of which matches the /api/ 404 fingerprint.
+        # The pre-v0.6.1 fixture had this probe's body matching the
+        # sentinel — that's actually DEAD, not BLOCKED, and v0.6.1 now
+        # surfaces it correctly. Healthy fixtures must reflect a real
+        # post-fix shape.
         results = [
             _r("api-sentinel-404-a", status=404, body_md5="sent"),
             _r("api-sentinel-404-b", status=404, body_md5="sent"),
             _r("api-sentinel-404-c", status=404, body_md5="sent"),
             _r("non-api-sentinel-404", status=404, body_md5="bare"),
             _r("me", auth="valid", status=200, body_md5="real"),
-            _r("stats-leak-check", status=404, body_md5="sent"),
+            _r("stats-leak-check", status=302, body_md5="login-page",
+                location="/login/?next=%2Fendpoint%2Fstats"),
         ]
         annotate_verdicts(results)
         s = summary(results)
