@@ -175,7 +175,10 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(snap["tool"], "wdgwars-api-tester")
         probe_names = {r["probe"] for r in snap["results"]}
         for documented in ("api-root", "me", "upload-history",
-                            "upload-csv", "signed-upload",
+                            "upload-csv", "v2-upload-csv", "signed-upload",
+                            "me-aps", "aircraft", "meshcore",
+                            "territories", "member-territories",
+                            "leaderboard", "bounties",
                             "health-asked-for", "stats-leak-check",
                             "non-api-sentinel-404", "changelog-control",
                             "api-sentinel-404-a", "api-sentinel-404-b",
@@ -415,6 +418,56 @@ class IntegrationTests(unittest.TestCase):
         self.assertIn("WDGWARS_KIND=regression", text)
         self.assertIn("WDGWARS_RECOVERY=0", text)
 
+    # ──────────── v2-upload-csv async round-trip ─────────────────────────
+
+    def test_21_v2_upload_csv_round_trip_against_healthy(self):
+        """Healthy mock: POST 202 → poll → done → status rewritten to 200,
+        verdict OK, no error. Proves the custom_runner dispatch + the full
+        async pipeline work end-to-end against a mock that follows the
+        documented two-step contract.
+        """
+        rc, out, err = run_tool("--json", "--no-table",
+                                "--key", "x" * 64,
+                                "--hosts", self.mock_url("healthy"),
+                                "--variants", "valid",
+                                timeout=60.0)
+        self.assertIn(rc, (0, 1))
+        snap = json.loads(out)
+        v2 = [r for r in snap["results"]
+              if r["probe"] == "v2-upload-csv" and r["auth"] == "valid"]
+        self.assertEqual(len(v2), 1, f"expected one v2 valid result, got {v2}")
+        r = v2[0]
+        self.assertEqual(r["status"], 200,
+                          f"v2 round-trip should rewrite status to 200 on done; "
+                          f"got {r}")
+        self.assertEqual(r["verdict"], "OK", f"verdict should be OK; got {r}")
+        self.assertEqual(r["error"], "")
+
+    def test_22_v2_upload_csv_marked_dead_during_outage(self):
+        """Outage mock: POST hits the styled-404 fallthrough; custom_runner
+        short-circuits without polling because status != 2xx. The shared
+        body_md5 lines up with the sentinel fingerprint so DEAD verdict
+        fires — same blast radius as a v1 endpoint going dark.
+
+        `none` is included in variants so the sentinel probes (which are
+        needs_auth=False) actually run and establish the canonical /api/
+        404 fingerprint. Without that, DEAD detection is disabled and the
+        v2 result falls through to a plain 404 verdict — see test_10.
+        """
+        rc, out, err = run_tool("--json", "--no-table",
+                                "--key", "x" * 64,
+                                "--hosts", self.mock_url("outage"),
+                                "--variants", "none,valid",
+                                timeout=60.0)
+        self.assertEqual(rc, 1)
+        snap = json.loads(out)
+        v2 = [r for r in snap["results"]
+              if r["probe"] == "v2-upload-csv" and r["auth"] == "valid"]
+        self.assertEqual(len(v2), 1)
+        self.assertEqual(v2[0]["verdict"], "DEAD",
+                          f"v2 should be DEAD when styled-404 fingerprint "
+                          f"matches; got {v2[0]}")
+
 
 # ──────────── Live-only tests (opt-in via --live or INTEGRATION_LIVE=1) ──
 
@@ -433,7 +486,10 @@ class LiveTests(unittest.TestCase):
         snap = json.loads(out)
         probe_names = {r["probe"] for r in snap["results"]}
         for documented in ("api-root", "me", "upload-history",
-                            "upload-csv", "signed-upload",
+                            "upload-csv", "v2-upload-csv", "signed-upload",
+                            "me-aps", "aircraft", "meshcore",
+                            "territories", "member-territories",
+                            "leaderboard", "bounties",
                             "health-asked-for", "stats-leak-check",
                             "non-api-sentinel-404", "changelog-control",
                             "api-sentinel-404-a", "api-sentinel-404-b",

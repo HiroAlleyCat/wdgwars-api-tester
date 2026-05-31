@@ -98,6 +98,81 @@ UPLOAD_CSV_OK_BODY = json.dumps({
     "merged_samples": 0,
 }).encode()
 
+# /api/me/aps — caller's own AP rows. Top-level {ok:true, count, aps:[...]}.
+ME_APS_OK_BODY = json.dumps({
+    "ok": True,
+    "count": 1,
+    "truncated": False,
+    "server_time": "2026-05-30T00:00:00Z",
+    "aps": [{"lat": 41.0, "lng": -81.0, "ssid": "MockNet",
+             "type": "WIFI", "captured_at": "2026-05-30T00:00:00Z"}],
+}).encode()
+
+# /api/aircraft, /api/meshcore, /api/territories — top-level arrays per docs.
+AIRCRAFT_OK_BODY = json.dumps([
+    {"icao": "ABC123", "callsign": "MOCK1", "latitude": 41.0,
+     "longitude": -81.0, "altitude_ft": 35000, "speed_kt": 450,
+     "heading": 270.5},
+]).encode()
+
+MESHCORE_OK_BODY = json.dumps([
+    {"node_id": "mock-01", "node_type": "mesh", "name": "MockMesh",
+     "latitude": 41.0, "longitude": -81.0, "rssi": -67},
+]).encode()
+
+TERRITORIES_OK_BODY = json.dumps([
+    {"name": "MOCK", "color": "#a855f7", "rank": 1, "points": 100,
+     "hull": [[41.0, -81.0], [41.1, -81.0], [41.0, -81.1]]},
+]).encode()
+
+# /api/member-territories — {ok:true, grid_lat, grid_lng, cells:[], gang_hulls:[]}.
+MEMBER_TERRITORIES_OK_BODY = json.dumps({
+    "ok": True,
+    "grid_lat": 0.02,
+    "grid_lng": 0.03,
+    "cells": [{"lat": 41.0, "lng": -81.0, "color": "#a855f7",
+               "user_id": 1, "gang_id": 1, "gang": "MOCK", "count": 5}],
+    "gang_hulls": [{"gang": "MOCK", "color": "#a855f7",
+                     "hull": [[41.0, -81.0], [41.1, -81.0], [41.0, -81.1]]}],
+}).encode()
+
+# /api/leaderboard — 5 boards.
+LEADERBOARD_OK_BODY = json.dumps({
+    "today": [{"user_id": 1, "username": "mock", "total": 1}],
+    "week": [{"user_id": 1, "username": "mock", "total": 7}],
+    "all_time": [{"user_id": 1, "username": "mock",
+                   "wifi": 100, "ble": 50, "aircraft": 25, "mesh": 5,
+                   "total": 180}],
+    "gangs": [{"gang_id": 1, "name": "MOCK", "member_count": 1,
+                "ap_count": 100}],
+    "hunters": [{"user_id": 1, "username": "mock", "completed": 1,
+                  "earned": 100, "active_cells": 1}],
+    "limit": 25,
+}).encode()
+
+# /api/bounties — {bounties:[]} per docs.
+BOUNTIES_OK_BODY = json.dumps({"bounties": []}).encode()
+
+# /api/v2/upload-csv — POST 202 returning a job pointer.
+V2_UPLOAD_CSV_ACCEPTED_BODY = json.dumps({
+    "ok": True,
+    "job_id": 42,
+    "poll_url": "/api/v2/upload-job/42",
+}).encode()
+
+# /api/v2/upload-job/<id> — GET 200 returning terminal `done` immediately.
+# Tests for stalled jobs would need a separate scenario; this is the
+# happy-path body that healthy/partial scenarios serve.
+V2_UPLOAD_JOB_DONE_BODY = json.dumps({
+    "ok": True,
+    "job_id": 42,
+    "status": "done",
+    "result": {
+        "imported": 5, "captured": 5, "updated": 0, "duplicates": 0,
+        "no_gps": 0, "bad_rows": 0, "cooldown": 0,
+    },
+}).encode()
+
 CHANGELOG_BODY = (b"<!doctype html><html><body><h1>Changelog</h1>"
                    b"<p>Mock changelog page for testing.</p></body></html>")
 
@@ -200,6 +275,51 @@ class MockHandler(http.server.BaseHTTPRequestHandler):
             if not api_key or api_key == "g" * 64:
                 return 401, b'{"error":"auth required"}', "application/json"
             return 200, UPLOAD_CSV_OK_BODY, "application/json"
+        if path == "/api/v2/upload-csv":
+            if method != "POST":
+                return 405, b"Method Not Allowed", "text/plain"
+            if not api_key or api_key == "g" * 64:
+                return 401, b'{"error":"auth required"}', "application/json"
+            return 202, V2_UPLOAD_CSV_ACCEPTED_BODY, "application/json"
+        if path.startswith("/api/v2/upload-job/"):
+            if method != "GET":
+                return 405, b"Method Not Allowed", "text/plain"
+            if not api_key or api_key == "g" * 64:
+                return 401, b'{"error":"auth required"}', "application/json"
+            # Always return terminal `done` immediately. A future scenario
+            # could add a stall mode (status=queued forever) to test the
+            # poll-budget timeout path.
+            return 200, V2_UPLOAD_JOB_DONE_BODY, "application/json"
+        if path.startswith("/api/me/aps"):
+            if method != "GET":
+                return 405, b"Method Not Allowed", "text/plain"
+            if not api_key or api_key == "g" * 64:
+                return 401, b'{"error":"auth required"}', "application/json"
+            return 200, ME_APS_OK_BODY, "application/json"
+        if path == "/api/aircraft":
+            if not api_key or api_key == "g" * 64:
+                return 401, b'{"error":"auth required"}', "application/json"
+            return 200, AIRCRAFT_OK_BODY, "application/json"
+        if path == "/api/meshcore":
+            if not api_key or api_key == "g" * 64:
+                return 401, b'{"error":"auth required"}', "application/json"
+            return 200, MESHCORE_OK_BODY, "application/json"
+        if path == "/api/territories":
+            if not api_key or api_key == "g" * 64:
+                return 401, b'{"error":"auth required"}', "application/json"
+            return 200, TERRITORIES_OK_BODY, "application/json"
+        if path == "/api/member-territories":
+            if not api_key or api_key == "g" * 64:
+                return 401, b'{"error":"auth required"}', "application/json"
+            return 200, MEMBER_TERRITORIES_OK_BODY, "application/json"
+        if path == "/api/leaderboard":
+            if not api_key or api_key == "g" * 64:
+                return 401, b'{"error":"auth required"}', "application/json"
+            return 200, LEADERBOARD_OK_BODY, "application/json"
+        if path == "/api/bounties":
+            if not api_key or api_key == "g" * 64:
+                return 401, b'{"error":"auth required"}', "application/json"
+            return 200, BOUNTIES_OK_BODY, "application/json"
         if path == "/api/upload/":
             # POST-only endpoint. GET should return 405 when healthy.
             if method == "GET":

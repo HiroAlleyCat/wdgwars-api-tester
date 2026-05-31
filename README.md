@@ -74,7 +74,15 @@ If no key is found, the `valid` variant is dropped automatically and only the
 | `me` | GET | `/api/me` | yes | Identity. Unauth → 401, not 404. |
 | `upload-history` | GET | `/api/upload-history?limit=5` | yes | Added 2026-04-27. |
 | `upload-csv` | POST | `/api/upload-csv` | yes | Multipart WiGLE-1.6, mixed Types. |
+| `v2-upload-csv` | POST + GET | `/api/v2/upload-csv` → `/api/v2/upload-job/<id>` | yes | Async pipeline: POST 202 → poll until `done`/`failed` (6 polls @ 1s). Catches v2-parser regressions independent of v1. |
 | `signed-upload` | GET | `/api/upload/` | yes | HMAC JSON endpoint. GET → 405 if healthy. |
+| `me-aps` | GET | `/api/me/aps?limit=1` | yes | Caller's own AP read-back (supports `?since=` delta sync). |
+| `aircraft` | GET | `/api/aircraft` | yes | ADS-B live snapshot (top-level array). |
+| `meshcore` | GET | `/api/meshcore` | yes | MeshCore live snapshot (top-level array). |
+| `territories` | GET | `/api/territories` | yes | Global gang convex hulls (top-level array). |
+| `member-territories` | GET | `/api/member-territories` | yes | Cell-based grid + gang hulls. 5-min snapshot. |
+| `leaderboard` | GET | `/api/leaderboard` | yes | 5 boards. 5-min snapshot. |
+| `bounties` | GET | `/api/bounties` | yes | Open bounties (max 200). |
 | `health-asked-for` | GET | `/api/health` | no | Doesn't exist yet. Asked for in bug #1. |
 | `stats-leak-check` | GET | `/api/stats` | no | 200 here = LiteSpeed admin leak. |
 | `api-sentinel-404-a/b/c` | GET | `/api/<random>` × 3 | no | Quorum fingerprint of the /api/ 404 page (2-of-3 majority required). |

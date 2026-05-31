@@ -25,7 +25,7 @@ Quickstart:
 """
 from __future__ import annotations
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 GITHUB_URL = "https://github.com/HiroAlleyCat/wdgwars-api-tester"
 
 import argparse
@@ -42,7 +42,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 USER_AGENT = f"wdgwars-api-tester/{__version__} (+{GITHUB_URL})"
 
@@ -67,6 +67,13 @@ class Probe:
     body: Optional[bytes] = None
     content_type: Optional[str] = None
     notes: str = ""
+    # Escape hatch for probes that need more than a single request (e.g.
+    # the async v2 upload pipeline: POST → 202 + job_id → poll until
+    # done). When set, `_request()` delegates to this callable instead of
+    # doing its normal single-shot flow. The callable receives the same
+    # arguments as `_request` and must return a fully-populated Result.
+    # Keep this rare — most probes should fit the single-shot model.
+    custom_runner: Optional[Callable] = None
 
 
 def _csv_probe_body() -> tuple[bytes, str]:
@@ -108,8 +115,33 @@ def build_probes() -> list[Probe]:
         Probe("upload-csv", "POST", "/api/upload-csv", True, (200, 400),
               body=csv_body, content_type=csv_ct,
               notes="Multipart WiGLE-1.6 with mixed Types."),
+        Probe("v2-upload-csv", "POST", "/api/v2/upload-csv", True, (202,),
+              body=csv_body, content_type=csv_ct,
+              custom_runner=_v2_upload_csv_round_trip,
+              notes="Async upload. POST 202 + {job_id, poll_url}; tester "
+                    "polls /api/v2/upload-job/<id> until status=done|failed "
+                    "(6 polls @ 1s). Result.status is rewritten to 200 on "
+                    "a clean round-trip so the OK verdict fires."),
         Probe("signed-upload", "GET", "/api/upload/", True, (200, 405),
               notes="HMAC signed JSON endpoint. GET should be 405 if healthy."),
+        Probe("me-aps", "GET", "/api/me/aps?limit=1", True, (200,),
+              notes="Caller's-own AP delta-sync read path. Supports "
+                    "?since=ISO-Z and ?limit=N (1..500000)."),
+        Probe("aircraft", "GET", "/api/aircraft", True, (200,),
+              notes="ADS-B live snapshot. Top-level array (no {ok:true} "
+                    "wrapper). 60s server cache."),
+        Probe("meshcore", "GET", "/api/meshcore", True, (200,),
+              notes="MeshCore radio nodes. Top-level array. 60s cache."),
+        Probe("territories", "GET", "/api/territories", True, (200,),
+              notes="Global gang convex hulls. Top-level array."),
+        Probe("member-territories", "GET", "/api/member-territories", True, (200,),
+              notes="Cell-based grid (0.02° × 0.03° squares) + grid-traced "
+                    "gang hulls. 5-min cron snapshot."),
+        Probe("leaderboard", "GET", "/api/leaderboard", True, (200,),
+              notes="5 boards (today/week/all_time/gangs/hunters), top 25 "
+                    "each. 5-min cron snapshot."),
+        Probe("bounties", "GET", "/api/bounties", True, (200,),
+              notes="Currently-open bounties (max 200, reward DESC)."),
         Probe("health-asked-for", "GET", "/api/health", False, (200, 404),
               notes="Currently does not exist. Asked for in bug report ask #2."),
         Probe("stats-leak-check", "GET", "/api/stats", False, (404,),
@@ -162,8 +194,170 @@ class Result:
     verdict: str = ""  # set after sentinel comparison
 
 
+def _v2_upload_csv_round_trip(probe: Probe, host: str, auth: str,
+                              valid_key: Optional[str],
+                              timeout: float) -> "Result":
+    """Exercise the full async /api/v2/upload-csv pipeline as one probe.
+
+    Three failure modes get cleanly distinguished:
+
+    * Auth gate broken: POST returns the styled 404 / something other than
+      a real 401 for missing/garbage keys. Reported with the actual HTTP
+      status from the POST so DEAD detection still fires.
+    * v2 parser regression: POST 202s + returns a job_id, but the job
+      keeps reporting `queued`/`processing` past our poll cap, or comes
+      back `failed`. Reported as ERROR with a descriptive `error` field.
+    * Healthy: POST 202 → poll reaches `done`. Result.status is rewritten
+      to 200 so the existing `OK` verdict fires (the round-trip succeeded
+      end-to-end, even though the HTTP code along the way was 202).
+
+    The single Result aggregates wall-clock across POST + every poll.
+    Polling cap: 6 attempts at 1s each (7s total budget on top of the
+    POST). That's generous for the documented "ideal for large files"
+    pipeline without blocking the tester for minutes if the queue stalls.
+    """
+    url = host + probe.path
+    headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
+    if probe.needs_auth or auth != "none":
+        if auth == "valid" and valid_key:
+            headers["X-API-Key"] = valid_key
+        elif auth == "garbage":
+            headers["X-API-Key"] = GARBAGE_KEY
+    if probe.content_type and probe.body is not None:
+        headers["Content-Type"] = probe.content_type
+
+    post_req = urllib.request.Request(url, data=probe.body, headers=headers,
+                                       method="POST")
+    t0 = time.monotonic()
+    status = 0
+    body = b""
+    resp_headers: dict[str, str] = {}
+    err = ""
+
+    try:
+        with urllib.request.urlopen(post_req, timeout=timeout) as resp:
+            status = resp.status
+            body = resp.read(1024 * 1024)
+            resp_headers = {k.lower(): v for k, v in resp.headers.items()}
+    except urllib.error.HTTPError as e:
+        status = e.code
+        try:
+            body = e.read(1024 * 1024)
+        except Exception:
+            body = b""
+        try:
+            resp_headers = {k.lower(): v for k, v in e.headers.items()}
+        except Exception:
+            resp_headers = {}
+    except urllib.error.URLError as e:
+        err = f"URLError: {e.reason}"
+    except Exception as e:  # noqa: BLE001 — diagnostic tool, log anything
+        err = f"{type(e).__name__}: {e}"
+
+    # Non-2xx or no body: short-circuit, no poll. DEAD detection still
+    # fires correctly because the body_md5 we return is the POST body's.
+    poll_url = ""
+    job_id: Optional[int] = None
+    if not err and 200 <= status < 300 and body:
+        try:
+            parsed = json.loads(body.decode("utf-8", "replace"))
+        except Exception:
+            parsed = None
+        if isinstance(parsed, dict):
+            poll_url = str(parsed.get("poll_url") or "")
+            jid = parsed.get("job_id")
+            if isinstance(jid, int):
+                job_id = jid
+
+    if poll_url or job_id is not None:
+        if poll_url and not poll_url.startswith(("http://", "https://")):
+            poll_url = host + poll_url
+        elif not poll_url:
+            poll_url = f"{host}/api/v2/upload-job/{job_id}"
+
+        terminal: Optional[str] = None
+        last_poll_body = body
+        last_poll_status = status
+        last_poll_headers = resp_headers
+        for _attempt in range(6):
+            time.sleep(1.0)
+            poll_req = urllib.request.Request(
+                poll_url, headers=headers, method="GET",
+            )
+            try:
+                with urllib.request.urlopen(poll_req, timeout=timeout) as resp:
+                    last_poll_status = resp.status
+                    last_poll_body = resp.read(1024 * 1024)
+                    last_poll_headers = {k.lower(): v
+                                          for k, v in resp.headers.items()}
+            except urllib.error.HTTPError as e:
+                last_poll_status = e.code
+                try:
+                    last_poll_body = e.read(1024 * 1024)
+                except Exception:
+                    last_poll_body = b""
+                try:
+                    last_poll_headers = {k.lower(): v
+                                          for k, v in e.headers.items()}
+                except Exception:
+                    last_poll_headers = {}
+                terminal = f"poll HTTP {e.code}"
+                break
+            except urllib.error.URLError as e:
+                err = f"URLError on poll: {e.reason}"
+                break
+
+            try:
+                pj = json.loads(last_poll_body.decode("utf-8", "replace"))
+            except Exception:
+                pj = None
+            poll_status_field = (pj or {}).get("status") if isinstance(pj, dict) else None
+            if poll_status_field == "done":
+                terminal = "done"
+                break
+            if poll_status_field == "failed":
+                err = "job status=failed"
+                terminal = "failed"
+                break
+            # "queued" / "processing" / unknown → keep polling
+
+        if terminal == "done":
+            # Rewrite to 200 so the existing OK verdict fires. The
+            # round-trip is what's being probed, not the literal POST code.
+            status = 200
+        elif terminal is None and not err:
+            err = "v2 upload job did not terminate within poll budget"
+            status = last_poll_status or status
+        else:
+            status = last_poll_status or status
+
+        body = last_poll_body
+        resp_headers = last_poll_headers
+
+    elapsed_ms = int((time.monotonic() - t0) * 1000)
+    return Result(
+        probe=probe.name,
+        host=host,
+        auth=auth,
+        method=probe.method,
+        url=url,
+        status=status,
+        elapsed_ms=elapsed_ms,
+        body_len=len(body),
+        body_md5=hashlib.md5(body).hexdigest() if body else "",
+        content_type=resp_headers.get("content-type", ""),
+        cf_cache_status=resp_headers.get("cf-cache-status", ""),
+        x_request_id=resp_headers.get("x-request-id", ""),
+        server=resp_headers.get("server", ""),
+        error=err,
+    )
+
+
 def _request(probe: Probe, host: str, auth: str, valid_key: Optional[str],
              timeout: float) -> Result:
+    if probe.custom_runner is not None:
+        return probe.custom_runner(probe, host, auth, valid_key, timeout)
+
     url = host + probe.path
     headers = {"User-Agent": USER_AGENT, "Accept": "*/*"}
     if probe.needs_auth or auth != "none":
