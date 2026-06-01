@@ -13,6 +13,15 @@ to answer, in one command, the questions that took an hour of curl that day:
 
 Stdlib-only Python 3. No `pip install`. Single file.
 
+## Family
+
+Sibling repos in the WDGoWars feeder family:
+
+- [Muninn](https://github.com/HiroAlleyCat/adsb-to-wdgwars) — ADS-B feeder
+- [Heimdall](https://github.com/HiroAlleyCat/meshcore-to-wdgwars) — MeshCore LoRa feeder
+- [wigle-to-wdgwars](https://github.com/HiroAlleyCat/wigle-to-wdgwars) — WiGLE Wi-Fi/BLE feeder
+- [gungnir](https://github.com/HiroAlleyCat/gungnir) — shared HMAC transport library
+
 ## Quick start
 
 ```bash
