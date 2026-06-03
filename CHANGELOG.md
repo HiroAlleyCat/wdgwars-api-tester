@@ -5,6 +5,37 @@ All notable changes to `wdgwars-api-tester`.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.3] — 2026-06-03 — Security Notes catch-up
+
+Pure documentation release. Brings the family's documented security
+posture to api-tester. No code changes.
+
+### Added
+
+- `SECURITY.md`: documents the probe's outbound footprint, key
+  handling, the `--exec-on-change` threat model, and the alert payload
+  shapes. Ported from Heimdall and adapted for the probe-tool surface
+  (api-tester reads keys, never saves them; has alert paths the
+  uploaders don't).
+
+### Notes on what's intentionally NOT ported
+
+- `scripts/check_readme_examples.py` (the venv-form README linter the
+  three uploaders ship) is N/A for api-tester. The linter exists to
+  catch the post-PEP-668 footgun where users follow `python3
+  <script>.py` examples and hit `ModuleNotFoundError` because deps
+  live in `.venv/`. api-tester is single-file stdlib-only — no deps,
+  no venv requirement, no footgun. If a runtime dep is ever added,
+  port the linter at the same time.
+- `pages.yml` (the GitHub Pages workflow Muninn and Heimdall ship) is
+  N/A for api-tester. It publishes the `web/` Pyodide frontend those
+  two repos carry; api-tester has no browser-frontend surface.
+- `--setup` / `--update` / `--schedule` from the uploader family are
+  N/A here. api-tester reads keys from the shared family config path
+  (`~/.config/wigle-to-wdgwars/wdgwars.key`); it does not manage its
+  own. Scheduled monitoring is already covered by `--watch`, which is
+  designed for continuous probing rather than daily snapshots.
+
 ## [0.6.2] — 2026-06-03
 
 First family-alignment release. Pure housekeeping — no behavior changes
