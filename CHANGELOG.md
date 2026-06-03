@@ -5,19 +5,19 @@ All notable changes to `wdgwars-api-tester`.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.6.2] — 2026-06-03
+
+First family-alignment release. Pure housekeeping — no behavior changes
+to the probe itself. Brings wdgwars-api-tester to repo-hygiene parity
+with the other public feeders in the WDGoWars family.
 
 ### Added
 
-- `CHANGELOG.md` (this file).
+- `CHANGELOG.md` (this file), back-filled from git history.
 - `run.sh` / `run.bat` — double-clickable forward to `python3 wdgwars_api_tester.py "$@"`.
 - `update.sh` / `update.bat` — fetch the latest single-file script from `main`.
 - `scripts/smoke.sh` — pre-release smoke (import + `--version` + `--help` + offline tests + mock-server roundtrip).
 - README `## Updating` section.
-
-### Changed
-
-- README intro touch-up; no behavior change.
 
 ## [0.6.1] — 2026-05-30
 
@@ -85,7 +85,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Initial release. Probes apex with the `(none, garbage, valid)` auth-variant
   matrix; reports per-probe verdicts and an overall summary.
 
-[Unreleased]: https://github.com/HiroAlleyCat/wdgwars-api-tester/compare/v0.6.1...HEAD
+[0.6.2]: https://github.com/HiroAlleyCat/wdgwars-api-tester/releases/tag/v0.6.2
 [0.6.1]: https://github.com/HiroAlleyCat/wdgwars-api-tester/releases/tag/v0.6.1
 [0.6.0]: https://github.com/HiroAlleyCat/wdgwars-api-tester/releases/tag/v0.6.0
 [0.5.0]: https://github.com/HiroAlleyCat/wdgwars-api-tester/releases/tag/v0.5.0
