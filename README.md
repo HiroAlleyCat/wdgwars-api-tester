@@ -204,20 +204,45 @@ Body includes the `prev_overall → curr_overall` transition, per-probe deltas (
 
 ### Generic webhook (`--alert-webhook URL`)
 
-POSTs a JSON payload to any HTTP endpoint on state change. The payload carries multiple top-level keys so the same URL works for several services without per-service flags:
+POSTs a JSON payload to any HTTP endpoint on state change. The payload carries multiple top-level keys so the same URL works for several services without per-service flags. As of v0.10.0 the `text` + `content` fields carry plain-English prose so a Discord/Slack channel reader can understand them without context:
+
+```
+🚨 API status changed: all endpoints healthy → some endpoints down
+
+What changed since the last check:
+• team-me/valid: was healthy (HTTP 200), now timing out (>15s) or unreachable
+• team-id/valid: was healthy (HTTP 200), now timing out (>15s) or unreachable
+
+Current snapshot:
+• 13 endpoints healthy
+• 27 correctly rejecting unauthorized callers
+• 2 timed out or unreachable
+• 2 endpoints missing (404 sentinel match)
+• 3 background API 404 sentinel (probe of /api/<random>)
+
+→ Non-upstream probe regressed. Investigate.
+```
+
+The full payload:
 
 ```json
 {
-  "text": "🚨 wdgwars-api-tester: HEALTHY → OUTAGE+LEAK\n\n<deltas>\n\nverdicts: DEAD=10, LEAK=1",
+  "text": "🚨 API status changed: ... (the human-readable string above)",
   "content": "<same as text — Discord reads this>",
-  "title": "🚨 wdgwars-api-tester: HEALTHY → OUTAGE+LEAK",
+  "text_machine": "🚨 wdgwars-api-tester: HEALTHY → DEGRADED\n\n<deltas>\n\nverdicts: DEAD=2, ERROR=2, OK=13, ...",
+  "title": "🚨 API status changed: ...",
   "kind": "regression",
-  "overall": "OUTAGE+LEAK",
+  "overall": "DEGRADED",
+  "overall_human": "some endpoints down",
   "prev_overall": "HEALTHY",
-  "deltas": ["wdgwars.pl me/valid  OK/200 -> DEAD/404", "..."],
-  "by_verdict": {"DEAD": 10, "LEAK": 1, "OK": 1},
+  "prev_overall_human": "all endpoints healthy",
+  "deltas": ["wdgwars.pl team-me/valid  OK/200 -> ERROR/-", "..."],
+  "deltas_human": ["team-me/valid: was healthy (HTTP 200), now timing out ..."],
+  "by_verdict": {"OK": 13, "AUTH-REQUIRED": 27, "ERROR": 2, "DEAD": 2},
+  "by_verdict_human": ["13 endpoints healthy", "27 correctly rejecting ...", "..."],
+  "action": "Non-upstream probe regressed. Investigate.",
   "tool": "wdgwars-api-tester",
-  "version": "0.4.0"
+  "version": "0.10.0"
 }
 ```
 
@@ -226,6 +251,47 @@ POSTs a JSON payload to any HTTP endpoint on state change. The payload carries m
 - **n8n / Zapier / Make** can pick the structured fields directly.
 - **PagerDuty Events v2** — wrap with `--exec-on-change` (it expects a different envelope).
 - **Custom HTTP handlers** — read whatever they need from the structured fields.
+- **Tools that parsed the old jargon `text`** — read `text_machine` instead. Same format as v0.9.0 and earlier.
+
+### Morning digest (`--digest URL`)
+
+Oneshot mode that runs every probe once and POSTs a daily summary to a webhook. Pair with a systemd timer firing at the local hour you want the digest to land — typically 08:00 — so a Discord/Slack channel gets one readable "what happened overnight" post per day. Mutually exclusive with `--watch`.
+
+```bash
+# Append every --watch state change to a state log
+python3 wdgwars_api_tester.py --watch 1800 \
+  --alert-webhook "$DISCORD_LOUD_WEBHOOK" \
+  --state-log ~/wdgwars-api-tester/lab/state-log.jsonl
+
+# Fire the digest once (typically from a daily systemd timer at 08:00 local)
+python3 wdgwars_api_tester.py --digest "$DISCORD_LOUD_WEBHOOK" \
+  --state-log ~/wdgwars-api-tester/lab/state-log.jsonl
+```
+
+What the digest reads:
+
+```
+Morning report — 2026-06-04
+
+API status right now: **all endpoints healthy**
+50 probes ran.
+• 14 endpoints healthy
+• 27 correctly rejecting unauthorized callers
+• 2 endpoints missing (404 sentinel match)
+• 3 responding with 405 wrong-verb (endpoint healthy)
+• 3 background API 404 sentinel (probe of /api/<random>)
+
+Last 24 hours: 3 state changes (2 loud, 1 suppressed as LOCOSP upstream flap)
+• 1× HEALTHY → DEGRADED
+• 1× DEGRADED → HEALTHY
+
+Most-flapped probes:
+• team-me/valid: 3 transitions
+
+→ No action needed.
+```
+
+The window is configurable with `--digest-window-hours N` (default 24).
 
 ### Arbitrary command (`--exec-on-change CMD`)
 

@@ -25,7 +25,7 @@ Quickstart:
 """
 from __future__ import annotations
 
-__version__ = "0.9.0"
+__version__ = "0.10.0"
 GITHUB_URL = "https://github.com/HiroAlleyCat/wdgwars-api-tester"
 
 import argparse
@@ -896,6 +896,168 @@ def _should_suppress_alert(prev_overall: str, curr_overall: str,
                   f"LOCOSP upstream flap, no net regression")
 
 
+# ─────────────────── Plain-English humanizers (v0.10.0) ──────────────────────
+#
+# The structured fields in the webhook payload (verdicts, by_verdict, deltas)
+# are good for tooling but read as jargon to a community channel reader.
+# These helpers produce parallel human-readable strings for the loud-channel
+# Discord post. Structured fields stay untouched; the old jargon text is
+# preserved as `text_machine` for any consumer that parsed it.
+
+_VERDICT_HUMAN = {
+    "OK":                "healthy",
+    "AUTH-REQUIRED":     "rejecting unauthorized callers correctly",
+    "AUTH-REDIRECT":     "rejecting via login redirect",
+    "DEAD":              "route missing (matches the API 404 sentinel)",
+    "DEAD-NONAPI":       "page missing",
+    "LEAK":              "leaking LiteSpeed admin telemetry",
+    "404":               "returning 404 (not a sentinel match)",
+    "METHOD":            "responding with 405 wrong-verb (still healthy)",
+    "ERROR":             "timed out or unreachable",
+    "SENTINEL":          "API 404 sentinel (probe of /api/<random>)",
+    "SENTINEL-OUTLIER":  "API 404 sentinel disagreed with the quorum",
+    "SENTINEL-DIVERGED": "sentinel quorum BROKEN (route detection unreliable)",
+    "SENTINEL-NONAPI":   "non-API 404 sentinel",
+}
+
+
+def _humanize_verdict(verdict: str) -> str:
+    """Return a plain-English label for a verdict code. Falls back to the
+    verdict string itself for HTTP-numeric verdicts and unknowns."""
+    return _VERDICT_HUMAN.get(verdict, verdict)
+
+
+def _humanize_overall(overall: str) -> str:
+    """Plain-English version of an overall verdict. Handles the composite
+    +LEAK / +SENTINEL-DIVERGED suffixes."""
+    parts = overall.split("+")
+    base = parts[0]
+    suffixes = parts[1:]
+    mapping = {
+        "HEALTHY":     "all endpoints healthy",
+        "DEGRADED":    "some endpoints down",
+        "OUTAGE":      "main API endpoint down",
+        "UNREACHABLE": "can't reach the API",
+    }
+    text = mapping.get(base, base)
+    if "LEAK" in suffixes:
+        text += ", LiteSpeed admin telemetry leaking"
+    if "SENTINEL-DIVERGED" in suffixes:
+        text += ", route-detection sentinel broken"
+    return text
+
+
+def _probe_label_from_delta(line_label: str) -> str:
+    """Extract a clean probe label from a delta line's label field.
+
+    `_parse_delta_line` returns label='wdgwars.pl team-me/valid'. We trim the
+    host (it's almost always wdgwars.pl) and surface the probe + auth pair.
+    """
+    parts = line_label.split(None, 1)
+    if len(parts) == 2:
+        return parts[1]
+    return line_label
+
+
+def _humanize_delta_line(line: str) -> str:
+    """Turn a raw delta line into one plain-English sentence.
+
+    Input shapes (from _probe_deltas):
+        wdgwars.pl me/none           DEAD/404 -> AUTH-REQUIRED/401
+        wdgwars.pl team-me/valid     OK/200 -> ERROR/-
+        wdgwars.pl new-probe         NEW -> OK/200
+        wdgwars.pl old-probe         GONE (was OK/200)
+    """
+    if " NEW -> " in line:
+        try:
+            left, right = line.split(" NEW -> ", 1)
+            probe = _probe_label_from_delta(left.strip())
+            right = right.strip()
+            v = right.split("/", 1)[0] if "/" in right else right
+            return f"{probe}: new probe added — currently {_humanize_verdict(v)}"
+        except ValueError:
+            return line
+    if " GONE " in line or line.endswith(" GONE"):
+        try:
+            probe = _probe_label_from_delta(line.split(" GONE", 1)[0].strip())
+            return f"{probe}: probe removed"
+        except ValueError:
+            return line
+
+    parsed = _parse_delta_line(line)
+    if parsed is None:
+        return line
+    probe = _probe_label_from_delta(parsed["label"])
+    pv, cv = parsed["prev_verdict"], parsed["curr_verdict"]
+    ps, cs = parsed["prev_status"], parsed["curr_status"]
+    # Tighter prose for the most common transitions.
+    if pv == "OK" and cv == "ERROR":
+        return f"{probe}: was healthy (HTTP {ps}), now timing out (>15s) or unreachable"
+    if pv == "ERROR" and cv == "OK":
+        return f"{probe}: recovered — back to healthy (HTTP {cs})"
+    if pv == "OK" and cv == "DEAD":
+        return f"{probe}: was healthy, now route missing (404 sentinel match)"
+    if pv == "DEAD" and cv == "OK":
+        return f"{probe}: route restored — back to healthy (HTTP {cs})"
+    if pv == "OK" and cv in {"502", "503", "504", "522", "524"}:
+        return f"{probe}: was healthy, now HTTP {cv} from the CDN/origin (likely upstream flap)"
+    if cv == "OK" and pv in {"502", "503", "504", "522", "524"}:
+        return f"{probe}: recovered from HTTP {pv} — back to healthy"
+    pretty_prev = _humanize_verdict(pv)
+    pretty_curr = _humanize_verdict(cv)
+    prev_status = f"HTTP {ps}" if ps else "no status"
+    curr_status = f"HTTP {cs}" if cs else "no status"
+    return f"{probe}: was {pretty_prev} ({prev_status}), now {pretty_curr} ({curr_status})"
+
+
+# Display order for the verdict-summary bullet list. Most operationally
+# interesting buckets come first; sentinels group at the end as background.
+_VERDICT_DISPLAY_ORDER = [
+    "OK", "AUTH-REQUIRED", "ERROR", "DEAD", "DEAD-NONAPI", "LEAK",
+    "AUTH-REDIRECT", "METHOD", "404",
+    "SENTINEL", "SENTINEL-OUTLIER", "SENTINEL-DIVERGED", "SENTINEL-NONAPI",
+]
+
+
+def _humanize_verdict_summary(by_verdict: dict) -> list[str]:
+    """Turn the {verdict: count} dict into a sorted list of plain-English
+    bullet strings. Returns the bullets without leading markers."""
+    bullets = []
+    for k in _VERDICT_DISPLAY_ORDER:
+        n = by_verdict.get(k, 0)
+        if not n:
+            continue
+        noun = "endpoint" if n == 1 else "endpoints"
+        if k == "OK":
+            bullets.append(f"{n} {noun} healthy")
+        elif k == "AUTH-REQUIRED":
+            bullets.append(f"{n} correctly rejecting unauthorized callers")
+        elif k == "ERROR":
+            bullets.append(f"{n} timed out or unreachable")
+        elif k == "DEAD":
+            bullets.append(f"{n} {noun} missing (404 sentinel match)")
+        elif k == "DEAD-NONAPI":
+            bullets.append(f"{n} non-API {noun} missing")
+        elif k == "LEAK":
+            bullets.append(f"{n} leaking LiteSpeed admin telemetry")
+        elif k == "AUTH-REDIRECT":
+            bullets.append(f"{n} rejecting via login redirect")
+        elif k == "METHOD":
+            bullets.append(f"{n} responding with 405 wrong-verb (endpoint healthy)")
+        elif k == "404":
+            bullets.append(f"{n} returning 404 (not a sentinel match)")
+        elif k == "SENTINEL-DIVERGED":
+            bullets.append("sentinel quorum BROKEN — route detection unreliable")
+        elif k in {"SENTINEL", "SENTINEL-OUTLIER", "SENTINEL-NONAPI"}:
+            bullets.append(f"{n} background {_humanize_verdict(k)}")
+    # Catch HTTP-numeric verdicts (400, 500, etc.) and anything else.
+    extras = [(k, v) for k, v in by_verdict.items()
+              if k not in _VERDICT_DISPLAY_ORDER and v]
+    for k, v in sorted(extras):
+        bullets.append(f"{v} returning HTTP {k}")
+    return bullets
+
+
 def _format_webhook_payload(prev_overall: str, curr_overall: str,
                              deltas: list[str], by_verdict: dict) -> dict:
     """Formatter. Renders directional ↑/↓/↔ markers and a one-line action."""
@@ -946,15 +1108,66 @@ def _format_webhook_payload(prev_overall: str, curr_overall: str,
         body_parts.append(f"→ {action}")
     flat = "\n".join(body_parts)
 
+    # Plain-English version (v0.10.0). `text` + `content` carry this so Discord
+    # / Slack readers see human prose by default. The old jargon string is
+    # preserved as `text_machine` for any tooling that parsed it.
+    if curr_overall == "HEALTHY" and prev_overall != "HEALTHY":
+        human_headline = f"{emoji} API is fully healthy again ({_humanize_overall(prev_overall)} → all endpoints healthy)"
+    elif "SENTINEL-DIVERGED" in curr_overall:
+        human_headline = f"{emoji} Route-detection sentinel just broke — verdicts may be unreliable until investigated"
+    elif prev_overall != curr_overall:
+        human_headline = (f"{emoji} API status changed: "
+                          f"{_humanize_overall(prev_overall)} → {_humanize_overall(curr_overall)}")
+    else:
+        if dsum["upstream_flap_count"] == dsum["total_classified"] and dsum["total_classified"] > 0:
+            human_headline = (f"{emoji} Still {_humanize_overall(curr_overall)} — "
+                              f"LOCOSP CDN/origin flapping "
+                              f"({dsum['improved']} recovered, {dsum['regressed']} regressed)")
+        elif dsum["improved"] > dsum["regressed"]:
+            human_headline = (f"{emoji} Partial recovery — "
+                              f"{dsum['improved']} probes recovered, "
+                              f"{dsum['regressed']} regressed (overall {_humanize_overall(curr_overall)})")
+        elif dsum["regressed"] > dsum["improved"]:
+            human_headline = (f"{emoji} Partial regression — "
+                              f"{dsum['regressed']} probes regressed, "
+                              f"{dsum['improved']} recovered (overall {_humanize_overall(curr_overall)})")
+        else:
+            human_headline = (f"{emoji} {dsum['total_classified']} probes shifted, no net change "
+                              f"(overall {_humanize_overall(curr_overall)})")
+
+    human_deltas = [_humanize_delta_line(line) for line in deltas[:30]]
+    human_bullets = _humanize_verdict_summary(by_verdict)
+
+    human_parts = [human_headline]
+    if human_deltas:
+        human_parts.append("")
+        human_parts.append("What changed since the last check:")
+        for hd in human_deltas:
+            human_parts.append(f"• {hd}")
+    if human_bullets:
+        human_parts.append("")
+        human_parts.append("Current snapshot:")
+        for b in human_bullets:
+            human_parts.append(f"• {b}")
+    if action:
+        human_parts.append("")
+        human_parts.append(f"→ {action}")
+    human_flat = "\n".join(human_parts)
+
     return {
-        "text": flat,
-        "content": flat,
-        "title": headline,
+        "text": human_flat,
+        "content": human_flat,
+        "text_machine": flat,
+        "title": human_headline,
         "kind": kind,
         "overall": curr_overall,
         "prev_overall": prev_overall,
+        "overall_human": _humanize_overall(curr_overall),
+        "prev_overall_human": _humanize_overall(prev_overall),
         "deltas": list(deltas),
+        "deltas_human": human_deltas,
         "by_verdict": dict(by_verdict),
+        "by_verdict_human": human_bullets,
         "delta_summary": dsum,
         "action": action,
         "tool": "wdgwars-api-tester",
@@ -979,6 +1192,152 @@ def _post_webhook(url: str, payload: dict, timeout: float = 10.0) -> bool:
     except Exception as e:  # noqa: BLE001
         log.warning("webhook post failed: %s", e)
         return False
+
+
+# ───────────────────────── State-log + morning digest (v0.10.0) ────────────────
+#
+# The `--watch` loop optionally appends every state change to a JSONL state
+# log. The `--digest URL` oneshot mode reads the last 24h of that log, runs
+# probes once for a live snapshot, and POSTs a single readable morning summary
+# to a webhook. Pair with a systemd timer firing at 08:00 local time for a
+# daily heartbeat that doubles as a coverage signal.
+
+def _append_state_log(path: Path, prev_overall: str, curr_overall: str,
+                       deltas: list[str], by_verdict: dict,
+                       suppressed: bool, suppress_reason: str) -> None:
+    """Append one state-change record to a JSONL log. Best-effort — failure
+    to write logs a warning but does not interrupt the watch loop."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        record = {
+            "ts": int(time.time()),
+            "ts_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "prev_overall": prev_overall,
+            "curr_overall": curr_overall,
+            "deltas": list(deltas),
+            "by_verdict": dict(by_verdict),
+            "suppressed": bool(suppressed),
+            "suppress_reason": suppress_reason or "",
+            "tool": "wdgwars-api-tester",
+            "version": __version__,
+        }
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record) + "\n")
+    except OSError as e:
+        log.warning("state-log append failed at %s: %s", path, e)
+
+
+def _read_state_log_window(path: Path, since_ts: int) -> list[dict]:
+    """Read all state-log records since `since_ts` (unix seconds).
+    Missing file → []. Malformed lines are skipped with a warning."""
+    if not path or not path.exists():
+        return []
+    out = []
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    log.warning("skipping malformed state-log line: %s", line[:80])
+                    continue
+                if rec.get("ts", 0) >= since_ts:
+                    out.append(rec)
+    except OSError as e:
+        log.warning("state-log read failed at %s: %s", path, e)
+    return out
+
+
+def _summarize_state_log_window(records: list[dict]) -> dict:
+    """Reduce a list of state-change records into digest-friendly counts.
+
+    Returns:
+        {
+          "total_events":      int,  # all state changes in the window
+          "loud_events":       int,  # not suppressed
+          "suppressed_events": int,  # upstream-flap suppressions etc.
+          "transitions":       {transition_string: count},
+          "probes_touched":    {probe_label: count},
+        }
+    """
+    out = {"total_events": len(records), "loud_events": 0,
+           "suppressed_events": 0, "transitions": {}, "probes_touched": {}}
+    for rec in records:
+        if rec.get("suppressed"):
+            out["suppressed_events"] += 1
+        else:
+            out["loud_events"] += 1
+        t = f"{rec.get('prev_overall','?')} → {rec.get('curr_overall','?')}"
+        out["transitions"][t] = out["transitions"].get(t, 0) + 1
+        for line in rec.get("deltas", []) or []:
+            parsed = _parse_delta_line(line) or {}
+            label = parsed.get("label", "").split(None, 1)
+            if len(label) == 2:
+                probe = label[1]
+                out["probes_touched"][probe] = out["probes_touched"].get(probe, 0) + 1
+    return out
+
+
+def _format_digest_payload(results: list[Result], s: dict,
+                            window_summary: dict,
+                            window_hours: int = 24) -> dict:
+    """Build the morning-digest webhook payload. Different shape from the loud
+    state-change alerts so channel readers can tell them apart at a glance."""
+    today = time.strftime("%Y-%m-%d", time.gmtime())
+    bullets_now = _humanize_verdict_summary(s["by_verdict"])
+    overall_human = _humanize_overall(s["overall"])
+
+    parts = [f"Morning report — {today}", ""]
+    parts.append(f"API status right now: **{overall_human}**")
+    parts.append(f"{s['total']} probes ran.")
+    if bullets_now:
+        for b in bullets_now:
+            parts.append(f"• {b}")
+
+    parts.append("")
+    parts.append(f"Last {window_hours} hours: {window_summary['total_events']} state changes "
+                 f"({window_summary['loud_events']} loud, "
+                 f"{window_summary['suppressed_events']} suppressed as LOCOSP upstream flap)")
+    if window_summary["transitions"]:
+        top_transitions = sorted(window_summary["transitions"].items(),
+                                  key=lambda kv: -kv[1])[:5]
+        for trans, n in top_transitions:
+            parts.append(f"• {n}× {trans}")
+    if window_summary["probes_touched"]:
+        top_probes = sorted(window_summary["probes_touched"].items(),
+                             key=lambda kv: -kv[1])[:5]
+        parts.append("")
+        parts.append("Most-flapped probes:")
+        for probe, n in top_probes:
+            parts.append(f"• {probe}: {n} transitions")
+
+    parts.append("")
+    if s["overall"] == "HEALTHY":
+        parts.append("→ No action needed.")
+    else:
+        parts.append(f"→ Overall state is {s['overall']}. See loud-channel posts for details.")
+
+    flat = "\n".join(parts)
+    headline = f"Morning report — {today} — {overall_human}"
+
+    return {
+        "text": flat,
+        "content": flat,
+        "title": headline,
+        "kind": "digest",
+        "overall": s["overall"],
+        "overall_human": overall_human,
+        "total_probes": s["total"],
+        "by_verdict": dict(s["by_verdict"]),
+        "by_verdict_human": bullets_now,
+        "window_hours": window_hours,
+        "window_summary": window_summary,
+        "tool": "wdgwars-api-tester",
+        "version": __version__,
+    }
 
 
 # ───────────────────────────── Exec-on-change hook ───────────────────────────
@@ -1214,6 +1573,21 @@ def main(argv: Optional[list[str]] = None) -> int:
                    "WDGWARS_PREV_OVERALL, WDGWARS_DELTAS (newline-joined), "
                    "WDGWARS_VERDICTS (JSON), WDGWARS_RECOVERY (1/0), "
                    "WDGWARS_KIND (recovery|regression|diagnostic-broken).")
+    p.add_argument("--state-log", type=Path,
+                   help="In --watch mode, append every state change to this "
+                   "JSONL file. Records have ts, ts_iso, prev_overall, "
+                   "curr_overall, deltas, by_verdict, suppressed, "
+                   "suppress_reason, tool, version. Used by --digest to build "
+                   "the rolling 24h summary. Missing parents are created.")
+    p.add_argument("--digest",
+                   help="One-shot morning-digest mode. Runs every probe once, "
+                   "reads --state-log for the last 24h of state changes, and "
+                   "POSTs a single readable summary to the given webhook URL. "
+                   "Mutually exclusive with --watch. Pair with a systemd timer "
+                   "firing at the local hour you want the digest to land.")
+    p.add_argument("--digest-window-hours", type=int, default=24,
+                   help="How many hours of state-log history to include in the "
+                   "morning digest. Default 24.")
     p.add_argument("--outage-backoff-threshold", type=float, default=0.30,
                    help="In --watch mode, if at least this fraction of sweep "
                    "results are verdict=429 or verdict=ERROR (status=0), "
@@ -1273,6 +1647,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         args.alert_webhook = None
         args.silent_webhook = None
         args.exec_on_change = None
+
+    if args.digest and args.watch:
+        log.error("--digest and --watch are mutually exclusive. "
+                  "Run the digest as its own one-shot (e.g. from a systemd timer); "
+                  "let --watch handle continuous monitoring.")
+        return 2
 
     def one_pass() -> tuple[list[Result], dict, str]:
         results = run_once(hosts, variants, valid_key, args.timeout,
@@ -1370,6 +1750,11 @@ def main(argv: Optional[list[str]] = None) -> int:
                             deltas, s["by_verdict"])
                         log.info("  exec-on-change: %s",
                                  "ok" if ok else "FAILED")
+                    if args.state_log:
+                        _append_state_log(args.state_log,
+                                          last_overall, overall,
+                                          deltas, s["by_verdict"],
+                                          suppress, reason if suppress else "")
                 last_results = results
                 last_overall = overall
 
@@ -1401,6 +1786,27 @@ def main(argv: Optional[list[str]] = None) -> int:
                     time.sleep(args.watch)
         except KeyboardInterrupt:
             return 0
+
+    if args.digest:
+        results, s, _sig = one_pass()
+        window_hours = max(1, int(args.digest_window_hours))
+        since_ts = int(time.time()) - window_hours * 3600
+        records = (_read_state_log_window(args.state_log, since_ts)
+                   if args.state_log else [])
+        window_summary = _summarize_state_log_window(records)
+        payload = _format_digest_payload(results, s, window_summary,
+                                          window_hours=window_hours)
+        ok = _post_webhook(args.digest, payload)
+        log.info("digest: %s (overall=%s, total_probes=%d, "
+                 "window_events=%d loud=%d suppressed=%d)",
+                 "sent" if ok else "FAILED",
+                 s["overall"], s["total"],
+                 window_summary["total_events"],
+                 window_summary["loud_events"],
+                 window_summary["suppressed_events"])
+        if not args.no_table:
+            emit(results, s)
+        return 0 if ok else 1
 
     results, s, _ = one_pass()
     if args.baseline:
