@@ -5,6 +5,60 @@ All notable changes to `wdgwars-api-tester`.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.0] — 2026-06-04 — Plain-English webhook output + morning digest
+
+State-change webhook posts now read as plain English instead of jargon, and a
+new oneshot `--digest URL` mode emits a daily summary suitable for a community
+channel. Aimed at making the tool's Discord/Slack output legible to non-dev
+readers (mods, community members, anyone who isn't reading the source).
+
+### Added
+
+- Plain-English layer in `_format_webhook_payload`. The `text` + `content`
+  fields now carry human-readable prose ("API status changed: all endpoints
+  healthy → some endpoints down" / "team-me/valid: was healthy (HTTP 200),
+  now timing out (>15s) or unreachable" / "13 endpoints healthy, 2 timed
+  out"). The previous jargon string is preserved as `text_machine` for any
+  tooling that depended on parsing it.
+- New helpers: `_humanize_verdict`, `_humanize_overall`, `_humanize_delta_line`,
+  `_humanize_verdict_summary`. Each is independently unit-tested.
+- New payload fields: `text_machine`, `overall_human`, `prev_overall_human`,
+  `deltas_human`, `by_verdict_human`.
+- `--digest URL` oneshot mode. Runs all probes once, reads the last 24h from
+  the `--state-log` file, and POSTs a single readable morning summary. Pair
+  with a systemd timer firing at 08:00 local time. Mutually exclusive with
+  `--watch`.
+- `--state-log PATH` flag. In `--watch` mode, appends every state change
+  (including suppressed ones) to a JSONL log. Used by `--digest` for the
+  rolling 24h summary. Records carry `ts`, `ts_iso`, `prev_overall`,
+  `curr_overall`, `deltas`, `by_verdict`, `suppressed`, `suppress_reason`.
+- `--digest-window-hours` flag (default 24). How far back the digest reads.
+
+### Changed
+
+- `_format_webhook_payload`'s `text` + `content` fields are now human-readable
+  prose. Tools that consumed the old jargon should read `text_machine`. All
+  other structured fields (`deltas`, `by_verdict`, `delta_summary`, `action`,
+  `kind`, `overall`, `prev_overall`, `tool`, `version`) are unchanged.
+
+### Tests
+
+- `test_humanize.py` (15 tests) covering verdict / overall / delta-line /
+  summary humanizers and the updated payload formatter.
+- `test_digest.py` (10 tests) covering state-log append, windowed read,
+  malformed-line skipping, summarization, and digest payload shape.
+- `test_payload_has_slack_and_discord_keys` updated to assert on the new
+  human-readable strings + the preserved `text_machine` field.
+- Full suite: 124/124 pass.
+
+### Operational
+
+- The systemd user unit `~/.config/systemd/user/wdgwars-api-tester.service`
+  should add `--state-log ~/wdgwars-api-tester/lab/state-log.jsonl` to its
+  ExecStart so the digest has data to summarize.
+- A new timer + service pair `wdgwars-api-tester-digest.{timer,service}` runs
+  the digest at 08:00 America/New_York (handles DST automatically).
+
 ## [0.9.0] — 2026-06-04 — Restore upstream-flap suppression + `--silent-webhook`
 
 The v0.7.0 outage-backoff squash-merge (PR #4, commit 9b32b7f) collapsed a

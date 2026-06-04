@@ -416,13 +416,18 @@ class TestWebhookFormatter(unittest.TestCase):
             ["wdgwars.pl me/valid    OK/200 -> DEAD/404"],
             {"DEAD": 10, "LEAK": 1},
         )
-        # Discord webhooks read `content`
+        # Discord webhooks read `content` — v0.10.0 carries human-readable
+        # prose here instead of the raw jargon string.
         self.assertIn("content", p)
-        self.assertIn("OUTAGE+LEAK", p["content"])
-        # Slack incoming webhooks read `text`
+        self.assertIn("main API endpoint down", p["content"])
+        self.assertIn("leaking", p["content"])
+        # Slack incoming webhooks read `text` — same human-readable string.
         self.assertIn("text", p)
-        self.assertIn("OUTAGE+LEAK", p["text"])
-        # Generic / structured consumers
+        self.assertIn("main API endpoint down", p["text"])
+        # The old jargon string is preserved as `text_machine` for any
+        # tooling that depended on it.
+        self.assertIn("OUTAGE+LEAK", p["text_machine"])
+        # Generic / structured consumers — unchanged from v0.9.0.
         self.assertEqual(p["overall"], "OUTAGE+LEAK")
         self.assertEqual(p["prev_overall"], "HEALTHY")
         self.assertEqual(p["kind"], "regression")
