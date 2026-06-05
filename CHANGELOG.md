@@ -5,6 +5,61 @@ All notable changes to `wdgwars-api-tester`.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.2] - 2026-06-05 - Severity tag (low/medium/high) on every post + plural fixes
+
+State-change posts are now prefixed with `[low]` / `[medium]` / `[high]`
+so a mod-channel reader can scan and triage without parsing the verdict
+jargon. Designed to make the feed *useful knowledge*, not alarming.
+
+### Added
+
+- `_classify_severity(prev_overall, curr_overall, dsum)` helper. Maps a
+  state transition + delta summary to one of low | medium | high:
+  - **high** when current overall carries `+LEAK` (security exposure)
+    or is `OUTAGE`/`UNREACHABLE`. Steady-state outage stays high every
+    tick — severity follows current state, not delta direction.
+  - **medium** when fresh `DEGRADED` from `HEALTHY`, when sentinel
+    quorum just broke (`+SENTINEL-DIVERGED` new this tick), or when
+    there's a net regression NOT covered by upstream-flap.
+  - **low** for everything else: recoveries, steady-state DEGRADED with
+    no movement, upstream/CDN flap, sideways shuffle, partial
+    recoveries, new probes added. Persisting sentinel-diverged falls
+    through to low so mods don't get re-alerted about a known issue.
+- `severity` field in the structured payload alongside `kind`.
+- `WDGWARS_SEVERITY` env var exported to `--exec-on-change` callbacks.
+  Downstream consumers (`severity-router.sh` etc.) can route by
+  severity instead of inferring from KIND + OVERALL.
+- 16 new unit tests in `TestClassifySeverity` covering all three tiers,
+  precedence (LEAK beats DEGRADED), and the steady-state cases.
+- 4 new headline-shape tests in `TestWebhookHeadlineHasSeverityTag`.
+
+### Changed
+
+- Every headline (both jargon `text_machine` and human `text`/`content`)
+  now starts with `[low] ` / `[medium] ` / `[high] ` after any leading
+  emoji.
+- Singular/plural fixed in partial-recovery, partial-regression, and
+  sideways-shuffle headlines. "1 probes recovered" was the visible
+  eyesore in mod-channel screenshots; now "1 probe recovered" /
+  "2 probes recovered" depending on count.
+- `SENTINEL` and `SENTINEL-OUTLIER` snapshot bullets correctly
+  pluralize "sentinel" → "sentinels" for n > 1. The 3-probe quorum
+  always fires three so this is `n=3` in practice, but the rule was
+  off-by-default and reads as a typo.
+- `AUTH-REDIRECT` snapshot bullet rephrased from
+  "rejecting via login redirect" to
+  "wired through web-session login (working, not API-shape)". The old
+  text read like the endpoints were rejecting auth; the new text makes
+  it clear the auth gate IS working, the response shape just isn't
+  API-clean.
+
+### Operational
+
+- No systemd unit changes needed. `--exec-on-change` callers see one
+  extra env var; existing callers ignore unknown vars cleanly.
+- The Asgard severity-router.sh can be simplified in a future commit to
+  read `WDGWARS_SEVERITY` directly instead of mapping KIND + OVERALL.
+
 ## [0.12.1] - 2026-06-05 - PAYLOAD-TOO-LARGE verdict for the 15 MB upload cap
 
 LOCOSP rolled out a temporary 15 MB body cap on every wdgwars.pl upload

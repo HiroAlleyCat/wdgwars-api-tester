@@ -15,6 +15,7 @@ from wdgwars_api_tester import (
     TELEGRAM_DELTA_LIMIT,
     TELEGRAM_TEXT_LIMIT,
     _canonical_sentinel,
+    _classify_severity,
     _format_telegram_text,
     _format_webhook_payload,
     _probe_deltas,
@@ -24,6 +25,18 @@ from wdgwars_api_tester import (
     state_signature,
     summary,
 )
+
+
+def _dsum(improved=0, regressed=0, sideways=0, upstream_flap_count=0,
+          unclassified=0):
+    return {
+        "improved": improved,
+        "regressed": regressed,
+        "sideways": sideways,
+        "total_classified": improved + regressed + sideways,
+        "upstream_flap_count": upstream_flap_count,
+        "unclassified": unclassified,
+    }
 
 
 def _r(probe, host="https://wdgwars.pl", auth="none", status=200, body_md5="",
@@ -505,6 +518,174 @@ class TestWebhookFormatter(unittest.TestCase):
         self.assertIn("✅", _format_webhook_payload("DEGRADED", "HEALTHY", [], {})["title"])
         self.assertIn("🔧", _format_webhook_payload("DEGRADED", "DEGRADED+SENTINEL-DIVERGED", [], {})["title"])
         self.assertIn("🚨", _format_webhook_payload("HEALTHY", "OUTAGE", [], {})["title"])
+
+
+class TestClassifySeverity(unittest.TestCase):
+    """v0.12.2: severity mapping for mod-channel readability.
+
+    Reader contract: most posts should be low. Medium = "look when you
+    can". High = "API genuinely broken or data leaking".
+    """
+
+    # ───── high ─────
+
+    def test_outage_state_is_high(self):
+        self.assertEqual(
+            _classify_severity("HEALTHY", "OUTAGE", _dsum(regressed=5)),
+            "high",
+        )
+
+    def test_unreachable_state_is_high(self):
+        self.assertEqual(
+            _classify_severity("HEALTHY", "UNREACHABLE", _dsum(regressed=10)),
+            "high",
+        )
+
+    def test_leak_anywhere_in_overall_is_high(self):
+        self.assertEqual(
+            _classify_severity("HEALTHY", "DEGRADED+LEAK", _dsum(regressed=2)),
+            "high",
+        )
+        # Even steady-state, severity follows current state, not delta.
+        self.assertEqual(
+            _classify_severity("OUTAGE+LEAK", "OUTAGE+LEAK", _dsum()),
+            "high",
+        )
+
+    def test_steady_state_outage_is_still_high(self):
+        # An ongoing outage with no movement this tick is still HIGH.
+        # Severity is "what is the API like right now", not "did something
+        # just change".
+        self.assertEqual(
+            _classify_severity("OUTAGE", "OUTAGE", _dsum()),
+            "high",
+        )
+
+    # ───── medium ─────
+
+    def test_fresh_degraded_from_healthy_is_medium(self):
+        self.assertEqual(
+            _classify_severity("HEALTHY", "DEGRADED", _dsum(regressed=3)),
+            "medium",
+        )
+
+    def test_sentinel_diverged_first_time_is_medium(self):
+        self.assertEqual(
+            _classify_severity("HEALTHY", "HEALTHY+SENTINEL-DIVERGED",
+                                _dsum()),
+            "medium",
+        )
+
+    def test_net_regression_without_upstream_flap_is_medium(self):
+        # More regressed than improved, NOT covered by upstream-flap.
+        self.assertEqual(
+            _classify_severity("DEGRADED", "DEGRADED",
+                                _dsum(improved=1, regressed=3)),
+            "medium",
+        )
+
+    # ───── low ─────
+
+    def test_recovery_to_healthy_is_low(self):
+        self.assertEqual(
+            _classify_severity("OUTAGE", "HEALTHY",
+                                _dsum(improved=8)),
+            "low",
+        )
+
+    def test_steady_state_degraded_no_movement_is_low(self):
+        # Sat in DEGRADED, nothing moved. Not new. No action needed.
+        self.assertEqual(
+            _classify_severity("DEGRADED", "DEGRADED", _dsum()),
+            "low",
+        )
+
+    def test_upstream_flap_only_is_low(self):
+        # Net regression but ALL deltas are upstream flap → CDN, not
+        # server, not actionable on operator's side.
+        self.assertEqual(
+            _classify_severity("DEGRADED", "DEGRADED",
+                                _dsum(improved=1, regressed=3,
+                                      upstream_flap_count=4)),
+            "low",
+        )
+
+    def test_partial_recovery_within_degraded_is_low(self):
+        self.assertEqual(
+            _classify_severity("DEGRADED", "DEGRADED",
+                                _dsum(improved=3, regressed=0)),
+            "low",
+        )
+
+    def test_sideways_shuffle_is_low(self):
+        self.assertEqual(
+            _classify_severity("DEGRADED", "DEGRADED",
+                                _dsum(improved=2, regressed=2)),
+            "low",
+        )
+
+    # ───── ordering / precedence ─────
+
+    def test_leak_beats_degraded_severity(self):
+        # If both rules could apply, LEAK wins (high > medium).
+        self.assertEqual(
+            _classify_severity("HEALTHY", "DEGRADED+LEAK",
+                                _dsum(regressed=2)),
+            "high",
+        )
+
+    def test_persisting_sentinel_diverged_falls_to_low(self):
+        # Same sentinel-diverged state both ticks → not "just broke", no
+        # new bad news. Falls through to default low. The point is to
+        # avoid re-alerting mods every sweep tick about a known issue.
+        self.assertEqual(
+            _classify_severity("HEALTHY+SENTINEL-DIVERGED",
+                                "HEALTHY+SENTINEL-DIVERGED",
+                                _dsum()),
+            "low",
+        )
+
+
+class TestWebhookHeadlineHasSeverityTag(unittest.TestCase):
+    """v0.12.2: every headline is prefixed with [low|medium|high]."""
+
+    def test_severity_field_in_payload(self):
+        p = _format_webhook_payload(
+            "HEALTHY", "OUTAGE",
+            ["wdgwars.pl me/valid    OK/200 -> DEAD/404"],
+            {"DEAD": 10},
+        )
+        self.assertEqual(p["severity"], "high")
+
+    def test_human_headline_carries_severity_bracket(self):
+        p = _format_webhook_payload(
+            "HEALTHY", "OUTAGE",
+            ["wdgwars.pl me/valid    OK/200 -> DEAD/404"],
+            {"DEAD": 10},
+        )
+        self.assertTrue(
+            p["content"].startswith("[high]") or "[high]" in p["title"],
+            f"expected [high] prefix in title/content, got: {p['title']!r}",
+        )
+
+    def test_low_severity_prefix_on_recovery(self):
+        p = _format_webhook_payload(
+            "OUTAGE", "HEALTHY", [],
+            {"OK": 25},
+        )
+        self.assertEqual(p["severity"], "low")
+        self.assertIn("[low]", p["title"])
+
+    def test_singular_probe_word_in_partial_recovery(self):
+        # Was the visible bug in screenshots: "1 probes recovered".
+        p = _format_webhook_payload(
+            "DEGRADED", "DEGRADED",
+            ["wdgwars.pl team-me/valid    ERROR/- -> OK/200"],
+            {"OK": 15, "DEAD": 2},
+        )
+        # Should say "1 probe recovered" not "1 probes recovered".
+        self.assertIn("1 probe recovered", p["content"])
+        self.assertNotIn("1 probes recovered", p["content"])
 
 
 class TestRedactWebhookUrl(unittest.TestCase):

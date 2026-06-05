@@ -25,7 +25,7 @@ Quickstart:
 """
 from __future__ import annotations
 
-__version__ = "0.12.1"
+__version__ = "0.12.2"
 GITHUB_URL = "https://github.com/HiroAlleyCat/wdgwars-api-tester"
 
 import argparse
@@ -1076,15 +1076,28 @@ def _humanize_verdict_summary(by_verdict: dict) -> list[str]:
         elif k == "LEAK":
             bullets.append(f"{n} leaking LiteSpeed admin telemetry")
         elif k == "AUTH-REDIRECT":
-            bullets.append(f"{n} rejecting via login redirect")
+            bullets.append(f"{n} wired through web-session login "
+                           "(working, not API-shape)")
         elif k == "METHOD":
-            bullets.append(f"{n} responding with 405 wrong-verb (endpoint healthy)")
+            bullets.append(f"{n} responding with 405 wrong-verb "
+                           "(endpoint healthy)")
         elif k == "404":
             bullets.append(f"{n} returning 404 (not a sentinel match)")
         elif k == "SENTINEL-DIVERGED":
             bullets.append("sentinel quorum BROKEN, route detection unreliable")
-        elif k in {"SENTINEL", "SENTINEL-OUTLIER", "SENTINEL-NONAPI"}:
-            bullets.append(f"{n} background {_humanize_verdict(k)}")
+        elif k == "SENTINEL":
+            # Background quorum probes. Always plural in practice (3 fired
+            # per sweep) but handle n=1 cleanly in case a probe goes
+            # missing in the future.
+            label = "sentinel" if n == 1 else "sentinels"
+            bullets.append(f"{n} background API 404 {label} "
+                           "(probe of /api/<random>)")
+        elif k == "SENTINEL-OUTLIER":
+            label = "sentinel" if n == 1 else "sentinels"
+            bullets.append(f"{n} background API 404 {label} "
+                           "disagreed with the quorum")
+        elif k == "SENTINEL-NONAPI":
+            bullets.append(f"{n} background non-API 404 sentinel")
     # Catch HTTP-numeric verdicts (400, 500, etc.) and anything else.
     extras = [(k, v) for k, v in by_verdict.items()
               if k not in _VERDICT_DISPLAY_ORDER and v]
@@ -1093,24 +1106,82 @@ def _humanize_verdict_summary(by_verdict: dict) -> list[str]:
     return bullets
 
 
+def _probe_word(n: int) -> str:
+    """Singular/plural for count-words in headlines. Avoids the
+    "1 probes recovered" eyesore in partial-recovery / partial-regression
+    / sideways shapes when exactly one probe moved."""
+    return "probe" if n == 1 else "probes"
+
+
+def _classify_severity(prev_overall: str, curr_overall: str,
+                        dsum: dict) -> str:
+    """Map a (prev, curr, delta-summary) tuple to one of low|medium|high.
+
+    Reader contract:
+      high   - "API genuinely broken or data leaking. Act."
+      medium - "Look when you can. Not on fire."
+      low    - "FYI. No action needed."
+
+    Rules (in priority order):
+      * Current overall carries a security exposure (`+LEAK`) → high.
+        Severity follows CURRENT state, not delta direction. An ongoing
+        leak is still high even if no probes moved this tick.
+      * Current overall is OUTAGE or UNREACHABLE → high. Same reasoning.
+      * Just landed in DEGRADED from HEALTHY → medium. Net new degradation
+        but not a full outage.
+      * Sentinel quorum broke (+SENTINEL-DIVERGED) → medium. Verdicts may
+        be unreliable; service itself might be fine.
+      * Net regression (more probes worse than better) WITHOUT
+        upstream-flap covering it → medium. Real movement in the wrong
+        direction.
+      * Anything else → low. Recoveries, sideways shuffles, upstream
+        flaps, steady-state DEGRADED with no new bad news, new probes
+        added.
+    """
+    # Security or full-outage states dominate. Same severity whether you
+    # just entered them or you've been sitting in them all day.
+    if "LEAK" in curr_overall:
+        return "high"
+    base = curr_overall.split("+")[0]
+    if base in {"OUTAGE", "UNREACHABLE"}:
+        return "high"
+    # Fresh DEGRADED is medium. Steady-state DEGRADED is low (covered by
+    # the default fall-through below).
+    if "DEGRADED" in base and prev_overall.split("+")[0] == "HEALTHY":
+        return "medium"
+    # Sentinel broke - verdicts unreliable until investigated.
+    if "SENTINEL-DIVERGED" in curr_overall and "SENTINEL-DIVERGED" not in prev_overall:
+        return "medium"
+    # Net regression without upstream-flap cover is medium. If the
+    # regression IS just upstream flap (LOCOSP CDN), stays low.
+    is_flap_only = (dsum["upstream_flap_count"] == dsum["total_classified"]
+                    and dsum["total_classified"] > 0)
+    if dsum["regressed"] > dsum["improved"] and not is_flap_only:
+        return "medium"
+    return "low"
+
+
 def _format_webhook_payload(prev_overall: str, curr_overall: str,
                              deltas: list[str], by_verdict: dict) -> dict:
     """Formatter. Renders directional ↑/↓/↔ markers and a one-line action."""
     annotated, dsum = _annotate_deltas(deltas)
+    severity = _classify_severity(prev_overall, curr_overall, dsum)
+    sev_tag = f"[{severity}] "
 
     if curr_overall == "HEALTHY" and prev_overall != "HEALTHY":
         emoji, kind = "✅", "recovery"
-        headline = f"{emoji} wdgwars-api-tester: RECOVERED ({prev_overall} → {curr_overall})"
+        headline = f"{sev_tag}{emoji} wdgwars-api-tester: RECOVERED ({prev_overall} → {curr_overall})"
     elif "SENTINEL-DIVERGED" in curr_overall:
         emoji, kind = "🔧", "diagnostic-broken"
-        headline = f"{emoji} wdgwars-api-tester: {prev_overall} → {curr_overall}"
+        headline = f"{sev_tag}{emoji} wdgwars-api-tester: {prev_overall} → {curr_overall}"
     elif prev_overall != curr_overall:
         emoji, kind = "🚨", "regression"
-        headline = f"{emoji} wdgwars-api-tester: {prev_overall} → {curr_overall}"
+        headline = f"{sev_tag}{emoji} wdgwars-api-tester: {prev_overall} → {curr_overall}"
     else:
         if dsum["upstream_flap_count"] == dsum["total_classified"] and dsum["total_classified"] > 0:
             emoji, kind = "📡", "upstream-flap"
-            shape = f"LOCOSP upstream flap, {dsum['improved']} recovered, {dsum['regressed']} regressed"
+            shape = (f"LOCOSP upstream flap, {dsum['improved']} recovered, "
+                     f"{dsum['regressed']} regressed")
         elif dsum["improved"] > dsum["regressed"]:
             emoji, kind = "🔁", "partial-recovery"
             shape = f"{dsum['improved']} recovered, {dsum['regressed']} regressed"
@@ -1119,8 +1190,9 @@ def _format_webhook_payload(prev_overall: str, curr_overall: str,
             shape = f"{dsum['regressed']} regressed, {dsum['improved']} recovered"
         else:
             emoji, kind = "🔁", "sideways"
-            shape = f"{dsum['total_classified']} probes shifted, no net change"
-        headline = f"{emoji} wdgwars-api-tester: still {curr_overall} ({shape})"
+            n = dsum['total_classified']
+            shape = f"{n} {_probe_word(n)} shifted, no net change"
+        headline = f"{sev_tag}{emoji} wdgwars-api-tester: still {curr_overall} ({shape})"
 
     if (dsum["upstream_flap_count"] == dsum["total_classified"]
             and dsum["total_classified"] > 0
@@ -1147,27 +1219,37 @@ def _format_webhook_payload(prev_overall: str, curr_overall: str,
     # / Slack readers see human prose by default. The old jargon string is
     # preserved as `text_machine` for any tooling that parsed it.
     if curr_overall == "HEALTHY" and prev_overall != "HEALTHY":
-        human_headline = f"{emoji} API is fully healthy again ({_humanize_overall(prev_overall)} → all endpoints healthy)"
+        human_headline = (f"{sev_tag}{emoji} API is fully healthy again "
+                          f"({_humanize_overall(prev_overall)} → all endpoints healthy)")
     elif "SENTINEL-DIVERGED" in curr_overall:
-        human_headline = f"{emoji} Route-detection sentinel just broke. Verdicts may be unreliable until investigated."
+        human_headline = (f"{sev_tag}{emoji} Route-detection sentinel just broke. "
+                          "Verdicts may be unreliable until investigated.")
     elif prev_overall != curr_overall:
-        human_headline = (f"{emoji} API status changed: "
-                          f"{_humanize_overall(prev_overall)} → {_humanize_overall(curr_overall)}")
+        human_headline = (f"{sev_tag}{emoji} API status changed: "
+                          f"{_humanize_overall(prev_overall)} → "
+                          f"{_humanize_overall(curr_overall)}")
     else:
         if dsum["upstream_flap_count"] == dsum["total_classified"] and dsum["total_classified"] > 0:
-            human_headline = (f"{emoji} Still {_humanize_overall(curr_overall)}. "
-                              f"LOCOSP CDN/origin flapping "
-                              f"({dsum['improved']} recovered, {dsum['regressed']} regressed).")
+            human_headline = (f"{sev_tag}{emoji} Still {_humanize_overall(curr_overall)}. "
+                              "LOCOSP CDN/origin flapping "
+                              f"({dsum['improved']} recovered, "
+                              f"{dsum['regressed']} regressed).")
         elif dsum["improved"] > dsum["regressed"]:
-            human_headline = (f"{emoji} Partial recovery: "
-                              f"{dsum['improved']} probes recovered, "
-                              f"{dsum['regressed']} regressed (overall {_humanize_overall(curr_overall)}).")
+            human_headline = (f"{sev_tag}{emoji} Partial recovery: "
+                              f"{dsum['improved']} "
+                              f"{_probe_word(dsum['improved'])} recovered, "
+                              f"{dsum['regressed']} regressed "
+                              f"(overall {_humanize_overall(curr_overall)}).")
         elif dsum["regressed"] > dsum["improved"]:
-            human_headline = (f"{emoji} Partial regression: "
-                              f"{dsum['regressed']} probes regressed, "
-                              f"{dsum['improved']} recovered (overall {_humanize_overall(curr_overall)}).")
+            human_headline = (f"{sev_tag}{emoji} Partial regression: "
+                              f"{dsum['regressed']} "
+                              f"{_probe_word(dsum['regressed'])} regressed, "
+                              f"{dsum['improved']} recovered "
+                              f"(overall {_humanize_overall(curr_overall)}).")
         else:
-            human_headline = (f"{emoji} {dsum['total_classified']} probes shifted, no net change "
+            n = dsum['total_classified']
+            human_headline = (f"{sev_tag}{emoji} {n} {_probe_word(n)} shifted, "
+                              "no net change "
                               f"(overall {_humanize_overall(curr_overall)})")
 
     human_deltas = [_humanize_delta_line(line) for line in deltas[:30]]
@@ -1195,6 +1277,7 @@ def _format_webhook_payload(prev_overall: str, curr_overall: str,
         "text_machine": flat,
         "title": human_headline,
         "kind": kind,
+        "severity": severity,
         "overall": curr_overall,
         "prev_overall": prev_overall,
         "overall_human": _humanize_overall(curr_overall),
@@ -1472,6 +1555,11 @@ def _exec_on_change(cmd: str, prev_overall: str, curr_overall: str,
         "recovery" if env["WDGWARS_RECOVERY"] == "1"
         else "diagnostic-broken" if "SENTINEL-DIVERGED" in curr_overall
         else "regression")
+    # v0.12.2: severity (low|medium|high). Same classifier the webhook
+    # payload uses. Downstream consumers (severity-router.sh etc.) can
+    # route by severity instead of inferring from KIND + OVERALL.
+    _, dsum = _annotate_deltas(deltas)
+    env["WDGWARS_SEVERITY"] = _classify_severity(prev_overall, curr_overall, dsum)
     try:
         r = subprocess.run(cmd, shell=True, env=env, timeout=timeout,
                             capture_output=True, text=True)
@@ -1687,7 +1775,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                    "state change. Env vars exported: WDGWARS_OVERALL, "
                    "WDGWARS_PREV_OVERALL, WDGWARS_DELTAS (newline-joined), "
                    "WDGWARS_VERDICTS (JSON), WDGWARS_RECOVERY (1/0), "
-                   "WDGWARS_KIND (recovery|regression|diagnostic-broken).")
+                   "WDGWARS_KIND (recovery|regression|diagnostic-broken), "
+                   "WDGWARS_SEVERITY (low|medium|high) [v0.12.2+].")
     p.add_argument("--state-log", type=Path,
                    help="In --watch mode, append every state change to this "
                    "JSONL file. Records have ts, ts_iso, prev_overall, "
