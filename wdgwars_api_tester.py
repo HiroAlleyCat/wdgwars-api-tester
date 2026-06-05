@@ -25,7 +25,7 @@ Quickstart:
 """
 from __future__ import annotations
 
-__version__ = "0.12.0"
+__version__ = "0.12.1"
 GITHUB_URL = "https://github.com/HiroAlleyCat/wdgwars-api-tester"
 
 import argparse
@@ -653,6 +653,13 @@ def annotate_verdicts(results: list[Result]) -> None:
             r.verdict = "404"
         elif r.status == 405:
             r.verdict = "METHOD"
+        elif r.status == 413 and '"error":"payload-too-large"' in r.body_excerpt:
+            # LOCOSP added a temporary 15 MB upload cap on 2026-06-05 with a
+            # structured 413 envelope. Surface it as a distinct verdict so
+            # future sweeps don't bury it under a generic "413" label.
+            # The cap is expected to be removed in roughly 2 weeks after a
+            # host migration, at which point this branch goes cold.
+            r.verdict = "PAYLOAD-TOO-LARGE"
         elif 400 <= r.status < 500:
             r.verdict = f"{r.status}"
         elif r.status >= 500:
@@ -665,7 +672,7 @@ def annotate_verdicts(results: list[Result]) -> None:
 
 VERDICT_PRIORITY = {
     "ERROR": 0, "SENTINEL-DIVERGED": 1, "LEAK": 2, "DEAD": 3, "DEAD-NONAPI": 4,
-    "SENTINEL-OUTLIER": 5, "404": 6, "METHOD": 7,
+    "SENTINEL-OUTLIER": 5, "404": 6, "METHOD": 7, "PAYLOAD-TOO-LARGE": 7,
     "REDIRECT-301": 8, "REDIRECT-303": 8, "REDIRECT-307": 8, "REDIRECT-308": 8,
     "AUTH-REQUIRED": 9, "AUTH-REDIRECT": 10, "OK": 11,
     "BLOCKED": 12, "SENTINEL": 13, "SENTINEL-NONAPI": 14,

@@ -221,6 +221,47 @@ class TestAnnotateVerdicts(unittest.TestCase):
         ac = next(r for r in results if r.probe == "aircraft")
         self.assertEqual(ac.verdict, "LEAK")
 
+    # ───────── 2026-06-05 — PAYLOAD-TOO-LARGE verdict ─────────
+
+    def _result_with_excerpt(self, probe, status, body_excerpt):
+        """413 verdict logic reads body_excerpt, which _r does not surface.
+        Build a Result directly for these tests."""
+        return Result(
+            probe=probe, host="https://wdgwars.pl", auth="valid",
+            method="POST", url="https://wdgwars.pl/" + probe, status=status,
+            elapsed_ms=10, body_len=200, body_md5="payload",
+            content_type="application/json", cf_cache_status="", x_request_id="",
+            server="", body_excerpt=body_excerpt,
+        )
+
+    def test_payload_too_large_fires_on_413_with_envelope(self):
+        envelope = (
+            '{"ok":false,"error":"payload-too-large","http_status":413,'
+            '"max_bytes":15728640,"received":31457480}'
+        )
+        results = [
+            _r("api-sentinel-404-a", status=404, body_md5="d"),
+            _r("api-sentinel-404-b", status=404, body_md5="d"),
+            _r("api-sentinel-404-c", status=404, body_md5="d"),
+            self._result_with_excerpt("upload-csv", 413, envelope),
+        ]
+        annotate_verdicts(results)
+        up = next(r for r in results if r.probe == "upload-csv")
+        self.assertEqual(up.verdict, "PAYLOAD-TOO-LARGE")
+
+    def test_bare_413_without_envelope_falls_back_to_bare_status(self):
+        """A 413 from CF or any non-LOCOSP layer with no payload-too-large
+        body must keep the generic '413' verdict, not the structured one."""
+        results = [
+            _r("api-sentinel-404-a", status=404, body_md5="d"),
+            _r("api-sentinel-404-b", status=404, body_md5="d"),
+            _r("api-sentinel-404-c", status=404, body_md5="d"),
+            self._result_with_excerpt("upload-csv", 413, "<html>nope</html>"),
+        ]
+        annotate_verdicts(results)
+        up = next(r for r in results if r.probe == "upload-csv")
+        self.assertEqual(up.verdict, "413")
+
     def test_stats_leak_check_with_login_redirect_does_not_fire_leak(self):
         # The 2026-05-30 false-positive case in one test: stats returns
         # 200/HTML (login page) without the LSWS fingerprint → must not

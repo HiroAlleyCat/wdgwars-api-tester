@@ -5,6 +5,32 @@ All notable changes to `wdgwars-api-tester`.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.1] - 2026-06-05 - PAYLOAD-TOO-LARGE verdict for the 15 MB upload cap
+
+LOCOSP rolled out a temporary 15 MB body cap on every wdgwars.pl upload
+endpoint on 2026-06-05 with a structured 413 envelope. Adds a dedicated
+verdict so future sweeps surface the cap cleanly instead of burying it
+under the generic "413" label. The tester does not POST large bodies in
+normal operation, so the verdict is defensive coverage rather than a
+path that fires today.
+
+### Added
+
+- `PAYLOAD-TOO-LARGE` verdict in `annotate_verdicts`. Fires when
+  `r.status == 413` AND `r.body_excerpt` contains the
+  `"error":"payload-too-large"` substring. Bare 413s from CF or other
+  upstream layers (no envelope) keep the generic "413" verdict so the
+  rule is precise. Priority slot 7, same tier as METHOD.
+- 2 new tests in `test_wdgwars_api_tester.py`: envelope-fires-verdict
+  and bare-413-falls-back-to-bare-status.
+
+### Notes
+
+- Cap is expected to be removed in roughly two weeks after LOCOSP's
+  host migration, at which point the branch goes cold. The verdict
+  itself can stay — it costs nothing and may catch any future
+  hosting-tier limit that returns the same envelope shape.
+
 ## [0.12.0] — 2026-06-05 — Repeatable --alert-webhook for multi-destination fan-out
 
 Single polling instance, multiple Discord/Slack/etc. destinations. Use when
