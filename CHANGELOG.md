@@ -5,6 +5,45 @@ All notable changes to `wdgwars-api-tester`.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.0] — 2026-06-05 — Repeatable --alert-webhook for multi-destination fan-out
+
+Single polling instance, multiple Discord/Slack/etc. destinations. Use when
+you want the same rich state-change payload mirrored into a partner's
+channel without doubling the API polling load (relevant given LOCOSP's
+midnight-UTC daily cap on `/api/*` traffic).
+
+### Changed
+
+- `--alert-webhook` is now `action="append"`. Pass it once for the
+  existing behavior; pass it N times to fan out the same payload to N
+  URLs. Each URL is POSTed independently; one failing does not block the
+  others (a partner's channel being down should not silence your own ops
+  channel).
+- Default changed from `None` to `None` (unchanged in absence) but the
+  attribute is a list once any flag is passed. Existing systemd units
+  with a single `--alert-webhook URL` need no edit; behavior is
+  byte-identical.
+- Journal log lines now print the redacted URL (`/<token>` masked) so
+  multi-URL deploys are debuggable without leaking the webhook secret.
+
+### Added
+
+- `_redact_webhook_url(url)` helper. Parses the URL and masks the last
+  path segment as `<token>`. Discord-shape webhooks (the secret token is
+  the last segment) come out fully redacted; other shapes fall back to
+  `https://host/<redacted>`.
+
+### Operational
+
+- For a multi-destination deploy, store URLs in an EnvironmentFile (mode
+  0600) and reference both in `ExecStart`:
+
+      EnvironmentFile=%h/lab/webhooks.env
+      ExecStart=... --alert-webhook ${ASGARD_URL} --alert-webhook ${PARTNER_URL}
+
+  Both URLs see the same payload on the same sweep tick; one polling
+  process, one state machine.
+
 ## [0.11.0] — 2026-06-04 — Team-messages probes + bounties cascade-fix note
 
 LOCOSP confirmed in #🛡️-mod-reports that the CF-Transform-Rule + REQUEST_URI

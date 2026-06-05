@@ -18,6 +18,7 @@ from wdgwars_api_tester import (
     _format_telegram_text,
     _format_webhook_payload,
     _probe_deltas,
+    _redact_webhook_url,
     annotate_verdicts,
     build_probes,
     state_signature,
@@ -463,6 +464,41 @@ class TestWebhookFormatter(unittest.TestCase):
         self.assertIn("✅", _format_webhook_payload("DEGRADED", "HEALTHY", [], {})["title"])
         self.assertIn("🔧", _format_webhook_payload("DEGRADED", "DEGRADED+SENTINEL-DIVERGED", [], {})["title"])
         self.assertIn("🚨", _format_webhook_payload("HEALTHY", "OUTAGE", [], {})["title"])
+
+
+class TestRedactWebhookUrl(unittest.TestCase):
+    """v0.12.0: when multiple --alert-webhook URLs are configured, journal
+    log lines print the URL so multi-destination fan-out is debuggable.
+    The secret token portion must be masked so the journal isn't a
+    credential leak vector.
+    """
+
+    def test_discord_webhook_token_is_masked(self):
+        url = "https://discord.com/api/webhooks/1510817125537943602/abc123secret"
+        out = _redact_webhook_url(url)
+        self.assertIn("discord.com", out)
+        self.assertIn("1510817125537943602", out)
+        self.assertNotIn("abc123secret", out)
+        self.assertIn("<token>", out)
+
+    def test_slack_incoming_webhook_token_is_masked(self):
+        # Slack URL shape: hooks.slack.com/services/T.../B.../<secret>
+        url = "https://hooks.slack.com/services/TAAAAAA/BBBBBBB/secretXYZ"
+        out = _redact_webhook_url(url)
+        self.assertNotIn("secretXYZ", out)
+        self.assertIn("<token>", out)
+
+    def test_short_url_falls_back_to_redacted_path(self):
+        url = "https://example.com/onlyone"
+        out = _redact_webhook_url(url)
+        self.assertIn("example.com", out)
+        self.assertIn("<redacted>", out)
+
+    def test_unparseable_does_not_raise(self):
+        # Empty-ish or weird inputs must not blow up the watch loop.
+        for bad in ("", "not a url at all", "://broken"):
+            out = _redact_webhook_url(bad)
+            self.assertIsInstance(out, str)
 
 
 class TestBuildProbes2026_06_03Surface(unittest.TestCase):

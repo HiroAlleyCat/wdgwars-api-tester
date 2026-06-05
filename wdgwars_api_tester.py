@@ -25,7 +25,7 @@ Quickstart:
 """
 from __future__ import annotations
 
-__version__ = "0.11.0"
+__version__ = "0.12.0"
 GITHUB_URL = "https://github.com/HiroAlleyCat/wdgwars-api-tester"
 
 import argparse
@@ -40,6 +40,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
@@ -1202,6 +1203,24 @@ def _format_webhook_payload(prev_overall: str, curr_overall: str,
     }
 
 
+def _redact_webhook_url(url: str) -> str:
+    """Mask the secret-bearing tail of a webhook URL so journal lines
+    don't leak the credential. Discord URLs have the shape
+    ``https://discord.com/api/webhooks/<id>/<token>`` where ``<token>``
+    is the secret; we drop it. For URLs without a clear two-segment tail
+    we fall back to host + ``/<redacted>``.
+    """
+    try:
+        parsed = urllib.parse.urlparse(url)
+        parts = [p for p in parsed.path.split("/") if p]
+        if len(parts) >= 2:
+            parts[-1] = "<token>"
+            return f"{parsed.scheme}://{parsed.netloc}/{'/'.join(parts)}"
+        return f"{parsed.scheme}://{parsed.netloc}/<redacted>"
+    except Exception:
+        return "<unparseable-url>"
+
+
 def _post_webhook(url: str, payload: dict, timeout: float = 10.0) -> bool:
     """POST a JSON payload to an arbitrary webhook URL."""
     data = json.dumps(payload).encode("utf-8")
@@ -1640,11 +1659,17 @@ def main(argv: Optional[list[str]] = None) -> int:
                    help="Override $TELEGRAM_CHAT_ID. Positive int for DMs, "
                    "negative for groups, -100... for channels.")
     p.add_argument("--alert-webhook",
+                   action="append", default=None,
                    help="In --watch mode, POST a JSON payload to this URL on "
-                   "every state change. Works for Discord webhooks, Slack "
-                   "incoming webhooks, n8n, PagerDuty Events v2, or any "
-                   "generic HTTP endpoint — payload carries both `text` "
-                   "(Slack), `content` (Discord), and structured fields.")
+                   "every state change. Repeatable: pass --alert-webhook "
+                   "multiple times to fan out the same payload to multiple "
+                   "destinations (e.g. your own ops channel + a partner's "
+                   "channel) without doubling the polling load. Each URL is "
+                   "POSTed independently; one failing does not block the "
+                   "others. Works for Discord webhooks, Slack incoming "
+                   "webhooks, n8n, PagerDuty Events v2, or any generic HTTP "
+                   "endpoint. Payload carries both `text` (Slack), `content` "
+                   "(Discord), and structured fields.")
     p.add_argument("--silent-webhook",
                    help="POST suppressed alerts (LOCOSP upstream flap "
                    "etc.) to this URL instead of dropping them to the "
@@ -1824,9 +1849,15 @@ def main(argv: Optional[list[str]] = None) -> int:
                     if args.alert_webhook and not suppress:
                         payload = _format_webhook_payload(
                             last_overall, overall, deltas, s["by_verdict"])
-                        ok = _post_webhook(args.alert_webhook, payload)
-                        log.info("  webhook: %s",
-                                 "sent" if ok else "FAILED")
+                        # Fan out to every --alert-webhook URL. POSTs are
+                        # independent: a failure on one URL must not block
+                        # the others (a partner's channel being down should
+                        # not silence our own ops channel).
+                        for url in args.alert_webhook:
+                            ok = _post_webhook(url, payload)
+                            log.info("  webhook: %s (%s)",
+                                     "sent" if ok else "FAILED",
+                                     _redact_webhook_url(url))
                     if args.exec_on_change and not suppress:
                         ok = _exec_on_change(
                             args.exec_on_change, last_overall, overall,
