@@ -25,7 +25,7 @@ Quickstart:
 """
 from __future__ import annotations
 
-__version__ = "0.12.2"
+__version__ = "0.12.3"
 GITHUB_URL = "https://github.com/HiroAlleyCat/wdgwars-api-tester"
 
 import argparse
@@ -739,6 +739,7 @@ def summary(results: list[Result]) -> dict:
 
 TELEGRAM_TEXT_LIMIT = 4096  # Telegram's per-message char cap
 TELEGRAM_DELTA_LIMIT = 30   # max delta lines included before truncation
+DISCORD_CONTENT_LIMIT = 2000  # Discord rejects content > 2000 chars with HTTP 400
 
 
 def _format_telegram_text(prev_overall: str, curr_overall: str,
@@ -1313,6 +1314,15 @@ def _redact_webhook_url(url: str) -> str:
 
 def _post_webhook(url: str, payload: dict, timeout: float = 10.0) -> bool:
     """POST a JSON payload to an arbitrary webhook URL."""
+    content = payload.get("content")
+    if isinstance(content, str) and len(content) > DISCORD_CONTENT_LIMIT:
+        # `content` is the Discord-compat field; cut on a line boundary so
+        # the truncation marker reads clean. `text` stays full-length for
+        # consumers without Discord's cap.
+        cut = content.rfind("\n", 0, DISCORD_CONTENT_LIMIT - 12)
+        if cut <= 0:
+            cut = DISCORD_CONTENT_LIMIT - 12
+        payload = {**payload, "content": content[:cut] + "\n… truncated"}
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         url, data=data,
